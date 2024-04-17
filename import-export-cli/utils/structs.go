@@ -139,6 +139,40 @@ type APIListResponse struct {
 	List  []API `json:"list"`
 }
 
+type Tenant struct {
+	Domain string `json:"domain"`
+	Status string `json:"status"`
+}
+
+type Pagination struct {
+	Offset   int32  `json:"offset"`
+	Limit    int32  `json:"limit"`
+	Total    int32  `json:"total"`
+	Previous string `json:"previous"`
+	Next     string `json:"next"`
+}
+
+type TenantListResponse struct {
+	Count      int32      `json:"count"`
+	List       []Tenant   `json:"list"`
+	Pagination Pagination `json:"pagination"`
+}
+
+type UploadAPI struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Version     string `json:"version"`
+	Description string `json:"description"`
+	Type        string `json:"type"`
+	Visibility  string `json:"visibility"`
+}
+
+type UploadAPIListResponse struct {
+	Count      int32       `json:"count"`
+	List       []UploadAPI `json:"list"`
+	Pagination Pagination  `json:"pagination"`
+}
+
 type APILoggerListResponse struct {
 	Apis []APILogger `json:"apis"`
 }

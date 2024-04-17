@@ -48,6 +48,7 @@ var insecure bool
 var cmdPassword string
 var CmdUsername string
 var CmdExportEnvironment string
+var CmdUploadEnvironment string
 var CmdResourceTenantDomain string
 var CmdForceStartFromBegin bool
 
@@ -199,7 +200,7 @@ func initConfig() {
 	*/
 }
 
-//disable flags when the mode set to kubernetes
+// disable flags when the mode set to kubernetes
 func isK8sEnabled() bool {
 	//Get config to check mode
 	configVars := utils.GetMainConfigFromFileSilently(utils.MainConfigFilePath)
@@ -210,7 +211,7 @@ func isK8sEnabled() bool {
 	}
 }
 
-//execute kubernetes commands
+// execute kubernetes commands
 func ExecuteKubernetes(arg ...string) {
 	cmd := exec.Command(
 		k8sUtils.Kubectl,
