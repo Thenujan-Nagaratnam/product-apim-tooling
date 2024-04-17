@@ -21,200 +21,229 @@ package impl
 import (
 	"encoding/json"
 	"fmt"
-	"net/http"
-	"strconv"
-	"time"
+	"sync"
+	"sync/atomic"
 
 	"github.com/go-resty/resty/v2"
 	"github.com/wso2/product-apim-tooling/import-export-cli/credentials"
 	"github.com/wso2/product-apim-tooling/import-export-cli/utils"
 )
 
-var tenants []utils.Tenant
-var accessToken string
 var onPremKey string
+var uploadedAPIs int32
+var totalAPIs int32
+var endpoint string
 
-func UploadAPIs(credential credentials.Credential, cmdUploadEnvironment string, cmdResourceTenantDomain string, cmdUsername, authToken string) {
-
-	onPremKey = authToken
-	token, preCommandErr := credentials.GetOAuthAccessToken(credential, cmdUploadEnvironment)
-	accessToken = token
-	if preCommandErr == nil {
-		// getTenantsEnv(cmdUploadEnvironment)
-		devPortalEndpoint := utils.GetDevPortalEndpointOfEnv(cmdUploadEnvironment, utils.MainConfigFilePath)
-		headers := make(map[string]string)
-		headers["API-KEY"] = onPremKey
-		fmt.Println("Removing existing APIs from vector DB..!")
-		resp, err := utils.InvokeDELETERequest("http://localhost:9090/ai/spec-populator/bulk-remove", headers)
-
-		if err != nil {
-			utils.HandleErrorAndExit("Error in removing existing APIs: ", err)
-			return
-		}
-
-		if resp.StatusCode() == http.StatusOK {
-			fmt.Println("Uploading APIs to vector DB...")
-			getTenants(devPortalEndpoint, "tenants?state=active&limit=100&offset=0")
-		} else if resp.StatusCode() == http.StatusUnauthorized {
-			fmt.Println("Error in removing existing APIs: ", string(resp.Body()))
-		}
-	} else {
-		fmt.Println("Error getting OAuth Tokens : " + preCommandErr.Error())
-	}
-}
-
-func getTenants(devPortalEndpoint, next string) {
-	devPortalEndpoint = utils.AppendSlashToString(devPortalEndpoint)
-
-	requestURL := devPortalEndpoint + next
-
-	resp, err := InvokeGETRequest(requestURL, "")
-
-	if err != nil {
-		utils.HandleErrorAndExit("Error in getting tenants: ", err)
-		return
-	}
-
-	tenantListResponse := &utils.TenantListResponse{}
-	unmarshalError := json.Unmarshal([]byte(resp.Body()), &tenantListResponse)
-
-	if unmarshalError != nil {
-		utils.HandleErrorAndExit(utils.LogPrefixError+"invalid JSON response", unmarshalError)
-	}
-
-	tenantCount := tenantListResponse.Pagination.Total
-
-	if tenantCount == 0 {
-		//handle carbon.super tenant
-		tenants = append(tenants, utils.Tenant{
-			Domain: utils.DefaultTenantDomain,
-			Status: "ACTIVE"})
-	} else {
-		//handle all tenants
-		tenants = tenantListResponse.List
-	}
-
-	// fmt.Println("Tenants: ", len(tenants))
-
-	for i := 0; i < len(tenants); i++ {
-		fmt.Println("\nuploading apis from tenant:", tenants[i].Domain)
-		getAPIInfo(devPortalEndpoint, tenants[i].Domain, "apis?limit=50&offset=0")
-	}
-
-	if tenantListResponse.Pagination.Next != "" {
-		getTenants(devPortalEndpoint, tenantListResponse.Pagination.Next)
-	}
-	time.Sleep(1 * time.Second)
-}
-
-func getAPIInfo(devPortalEndpoint, tenant, next string) {
-	requestURL := devPortalEndpoint + next
-	utils.Logln(utils.LogPrefixInfo+"ExportAPI: URL:", requestURL)
+func removeExistingAPIs() error {
 	headers := make(map[string]string)
-	headers["x-wso2-tenant"] = tenant
-	headers[utils.HeaderAccept] = utils.JsonArrayFormatType
+	headers["API-KEY"] = onPremKey
 
-	resp, err := utils.InvokeGETRequest(requestURL, headers)
+	var resp *resty.Response
+	var deleteErr error
 
-	if err != nil {
-		utils.HandleErrorAndExit("Error in getting APIInfo: ", err)
-		return
-	}
-
-	apiListResponse := &utils.UploadAPIListResponse{}
-	unmarshalError := json.Unmarshal([]byte(resp.Body()), &apiListResponse)
-
-	if unmarshalError != nil {
-		utils.HandleErrorAndExit(utils.LogPrefixError+"invalid JSON response", unmarshalError)
-	}
-
-	apiCount := apiListResponse.Pagination.Total
-
-	if apiCount == 0 {
-		fmt.Println("No APIs available to be uploaded..!")
-	} else {
-		upload(devPortalEndpoint, tenant, apiListResponse.List)
-		fmt.Println("Successfully uploaded " + strconv.Itoa(len(apiListResponse.List)) + " APIs..!")
-		if apiListResponse.Pagination.Next != "" {
-			getAPIInfo(devPortalEndpoint, tenant, apiListResponse.Pagination.Next)
-		}
-	}
-}
-
-func upload(devPortalEndpoint string, tenant string, apiList []utils.UploadAPI) {
-	payload := []map[string]string{}
-	for i := 0; i < len(apiList); i++ {
-
-		api := map[string]string{
-			"uuid":          apiList[i].ID,
-			"description":   apiList[i].Description,
-			"api_name":      apiList[i].Name,
-			"version":       apiList[i].Version,
-			"tenant_domain": tenant,
-			"api_type":      apiList[i].Type,
-		}
-
-		if apiList[i].Type == "HTTP" || apiList[i].Type == "APIPRODUCT" || apiList[i].Type == "REST" || apiList[i].Type == "SOAP" || apiList[i].Type == "SOAPTOREST" {
-			requestURL := devPortalEndpoint + "apis/" + apiList[i].ID + "/swagger"
-			resp, err := InvokeGETRequest(requestURL, tenant)
-			if err != nil {
-				utils.HandleErrorAndExit("Error in getting API swagger definition: ", err)
-				return
-			}
-			api["api_spec"] = resp.String()
-		} else if apiList[i].Type == "GRAPHQL" {
-			requestURL := devPortalEndpoint + "apis/" + apiList[i].ID + "/graphql-schema"
-			resp, err := InvokeGETRequest(requestURL, tenant)
-			if err != nil {
-				utils.HandleErrorAndExit("Error in getting API asynch definition: ", err)
-				return
-			}
-			api["async_spec"] = resp.String()
-		} else if apiList[i].Type == "WS" || apiList[i].Type == "WEBSUB" || apiList[i].Type == "ASYNC" || apiList[i].Type == "SSE" || apiList[i].Type == "WEBHOOK" {
-			requestURL := devPortalEndpoint + "apis/" + apiList[i].ID + "/async-api-specification"
-			resp, err := InvokeGETRequest(requestURL, tenant)
-			if err != nil {
-				utils.HandleErrorAndExit("Error in getting API graphql definition: ", err)
-				return
-			}
-			api["sdl_schema"] = resp.String()
-		} else {
+	for attempt := 1; attempt <= 2; attempt++ {
+		resp, deleteErr = utils.InvokeDELETERequest(endpoint+"/ai/spec-populator/bulk-remove", headers)
+		if deleteErr != nil {
+			fmt.Printf("Error removing existing APIs (attempt %d): %v\n", attempt, deleteErr)
 			continue
 		}
-		payload = append(payload, api)
+
+		if resp.StatusCode() != 200 {
+			fmt.Printf("Removing existing APIs failed with status %d (attempt %d)\n", resp.StatusCode(), attempt)
+			continue
+		}
+
+		fmt.Printf("Existing APIs removed successfully (attempt %d)\n", attempt)
+		return nil
 	}
 
-	InvokePOSTRequest(payload)
+	if deleteErr != nil {
+		return fmt.Errorf("Error removing existing APIs after retry: %v", deleteErr)
+	}
+	return fmt.Errorf("Removing existing APIs failed after retry")
+}
+
+func UploadAPIs(credential credentials.Credential, cmdUploadEnvironment string, cmdResourceTenantDomain string, cmdUsername, authToken, endpointUrl string) {
+
+	onPremKey = authToken
+	endpoint = endpointUrl
+
+	devPortalEndpoint := utils.GetDevPortalEndpointOfEnv(cmdUploadEnvironment, utils.MainConfigFilePath)
+
+	fmt.Println("Removing existing APIs from vector DB..!")
+	err := removeExistingAPIs()
+	if err != nil {
+		utils.HandleErrorAndExit("Error in removing existing APIs", err)
+	}
+
+	fmt.Println("Uploading APIs to vector DB...")
+
+	payloadQueue := make(chan []map[string]string, 2)
+
+	go produceAPIPayloads(devPortalEndpoint, payloadQueue)
+
+	numConsumers := 2
+	var wg sync.WaitGroup
+	for i := 0; i < numConsumers; i++ {
+		wg.Add(1)
+		go consumeAPIPayloads(payloadQueue, &wg)
+	}
+
+	wg.Wait()
+
+	fmt.Printf("\n%d APIs uploaded out of %d APIs.\n", totalAPIs, uploadedAPIs)
 }
 
 func InvokeGETRequest(requestURL, tenant string) (*resty.Response, error) {
 	utils.Logln(utils.LogPrefixInfo+"ExportAPI: URL:", requestURL)
 	headers := make(map[string]string)
-	headers[utils.HeaderAuthorization] = utils.HeaderValueAuthBearerPrefix + " " + accessToken
 	headers["x-wso2-tenant"] = tenant
 	headers[utils.HeaderAccept] = utils.JsonArrayFormatType
 
 	return utils.InvokeGETRequest(requestURL, headers)
 }
 
+func produceAPIPayloads(devPortalEndpoint string, payloadQueue chan<- []map[string]string) {
+	processTenants(devPortalEndpoint, "tenants?state=active&limit=100&offset=0", payloadQueue)
+	close(payloadQueue)
+}
+
+func processTenants(devPortalEndpoint, next string, payloadQueue chan<- []map[string]string) {
+	devPortalEndpoint = utils.AppendSlashToString(devPortalEndpoint)
+
+	requestURL := devPortalEndpoint + next
+	resp, err := InvokeGETRequest(requestURL, "")
+	if err != nil {
+		fmt.Println("Error in getting tenants:", err)
+		return
+	}
+
+	tenantListResponse := &utils.TenantListResponse{}
+	err = json.Unmarshal([]byte(resp.Body()), tenantListResponse)
+	if err != nil {
+		fmt.Println("Error unmarshalling tenant list response:", err)
+		return
+	}
+
+	tenantCount := tenantListResponse.Pagination.Total
+	if tenantCount == 0 {
+		// Handle carbon.super tenant
+		processAPIs(devPortalEndpoint, utils.DefaultTenantDomain, "apis?limit=50&offset=0", payloadQueue)
+	} else {
+		// Handle all tenants
+		for _, tenant := range tenantListResponse.List {
+			fmt.Println("Processing tenant:", tenant.Domain)
+			processAPIs(devPortalEndpoint, tenant.Domain, "apis?limit=50&offset=0", payloadQueue)
+		}
+	}
+
+	if tenantListResponse.Pagination.Next != "" {
+		processTenants(devPortalEndpoint, tenantListResponse.Pagination.Next, payloadQueue)
+	}
+}
+
+func processAPIs(devPortalEndpoint, tenant, next string, payloadQueue chan<- []map[string]string) {
+	requestURL := devPortalEndpoint + next
+
+	resp, err := InvokeGETRequest(requestURL, tenant)
+	if err != nil {
+		utils.HandleErrorAndContinue("Error in getting APIs for tenant: "+tenant, err)
+	}
+
+	apiListResponse := &utils.UploadAPIListResponse{}
+	err = json.Unmarshal([]byte(resp.Body()), apiListResponse)
+	if err != nil {
+		utils.HandleErrorAndContinue("Error unmarshalling API list response:", err)
+	}
+
+	atomic.AddInt32(&totalAPIs, apiListResponse.Pagination.Total)
+
+	payload := []map[string]string{}
+
+	for _, api := range apiListResponse.List {
+		apiPayload := map[string]string{
+			"uuid":          api.ID,
+			"description":   api.Description,
+			"api_name":      api.Name,
+			"version":       api.Version,
+			"tenant_domain": tenant,
+			"api_type":      api.Type,
+		}
+
+		switch api.Type {
+		case "HTTP", "APIPRODUCT", "REST", "SOAP", "SOAPTOREST":
+			requestURL := devPortalEndpoint + "apis/" + api.ID + "/swagger"
+			swaggerResp, err := InvokeGETRequest(requestURL, tenant)
+			if err == nil {
+				apiPayload["api_spec"] = swaggerResp.String()
+			} else {
+				utils.HandleErrorAndContinue("Error in getting swagger for API: "+api.ID, err)
+			}
+
+		case "GRAPHQL":
+			requestURL := devPortalEndpoint + "apis/" + api.ID + "/graphql-schema"
+			schemaResp, err := InvokeGETRequest(requestURL, tenant)
+			if err == nil {
+				apiPayload["sdl_schema"] = schemaResp.String()
+			} else {
+				utils.HandleErrorAndContinue("Error in getting Graphql schema for API: "+api.ID, err)
+			}
+
+		case "WS", "WEBSUB", "ASYNC", "SSE", "WEBHOOK":
+			requestURL := devPortalEndpoint + "apis/" + api.ID + "/async-api-specification"
+			asyncResp, err := InvokeGETRequest(requestURL, tenant)
+			if err == nil {
+				apiPayload["async_spec"] = asyncResp.String()
+			} else {
+				utils.HandleErrorAndContinue("Error in getting async spec for API: "+api.ID, err)
+			}
+		}
+		payload = append(payload, apiPayload)
+
+	}
+	payloadQueue <- payload
+}
+
+func consumeAPIPayloads(payloadQueue <-chan []map[string]string, wg *sync.WaitGroup) {
+	defer wg.Done()
+
+	for payload := range payloadQueue {
+		InvokePOSTRequest(payload)
+	}
+}
+
 func InvokePOSTRequest(payload []map[string]string) {
-	fmt.Println("Sending post request..!")
-	go func(payload []map[string]string) {
-		jsonData, err := json.Marshal(map[string]interface{}{"apis": payload})
-		if err != nil {
-			utils.HandleErrorAndExit("Error in marshalling payload: ", err)
+	fmt.Printf("Sending post request for %d APIs for tenant: %s\n", len(payload), payload[0]["tenant_domain"])
+	jsonData, err := json.Marshal(map[string]interface{}{"apis": payload})
+	if err != nil {
+		utils.HandleErrorAndContinue("Error in marshalling payload:", err)
+	}
+
+	headers := make(map[string]string)
+	headers["API-KEY"] = onPremKey
+	headers[utils.HeaderContentType] = utils.HeaderValueApplicationJSON
+
+	var resp *resty.Response
+	var uploadErr error
+
+	for attempt := 1; attempt <= 2; attempt++ {
+		resp, uploadErr = utils.InvokePOSTRequest(endpoint+"/ai/spec-populator/bulk-upload", headers, jsonData)
+		if uploadErr != nil {
+			fmt.Printf("API upload failed (attempt %d). Reason: %v\n", attempt, uploadErr)
+			continue
 		}
-		headers := make(map[string]string)
-		headers["API-KEY"] = onPremKey
-		headers[utils.HeaderContentType] = utils.HeaderValueApplicationJSON
 
-		resp, err := utils.InvokePOSTRequest("http://localhost:9000/ai/spec-populator/bulk-upload", headers, jsonData)
-
-		if err != nil {
-			utils.HandleErrorAndExit("API upload failed. Reason: ", err)
+		if resp.StatusCode() != 200 {
+			fmt.Printf("API upload failed with status %d (attempt %d).\n", resp.StatusCode(), attempt)
+			continue
 		}
 
-		fmt.Println("Response:", string(resp.Body()))
-	}(payload)
+		fmt.Printf("%d APIs uploaded successfully for tenant: %s (attempt %d)\n", len(payload), payload[0]["tenant_domain"], attempt)
+		atomic.AddInt32(&uploadedAPIs, int32(len(payload)))
+		break
+	}
 
+	if uploadErr != nil {
+		utils.HandleErrorAndContinue("API upload failed after retry. Reason: ", uploadErr)
+	}
 }

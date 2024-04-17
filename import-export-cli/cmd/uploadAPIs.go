@@ -30,12 +30,13 @@ const uploadAPIsCmdShortDesc = "Upload APIs for migration"
 
 const uploadAPIsCmdLongDesc = "Upload public APIs and API Products in an environment to a vector database to provide context to the marketplace assistant."
 const UploadAPIsCmdLongDesc = `Upload public APIs and API Products available in the environment specified by flag (--environment, -e)`
-const uploadAPIsCmdExamples = utils.ProjectName + ` ` + UploadCmdLiteral + ` ` + UploadAPIsCmdLiteral + ` --token <on-prem-key> -e dev`
+const uploadAPIsCmdExamples = utils.ProjectName + ` ` + UploadCmdLiteral + ` ` + UploadAPIsCmdLiteral + `--endpoint <endpoint-url> --token <on-prem-key> -e dev`
 
 var token string
+var endpoint string
 
 var UploadAPIsCmd = &cobra.Command{
-	Use: UploadAPIsCmdLiteral + " (--token <on-prem-key-of-the-organization> --environment " +
+	Use: UploadAPIsCmdLiteral + " (--endpoint <endpoint-url> --token <on-prem-key-of-the-organization> --environment " +
 		"<environment-from-which-artifacts-should-be-uploaded>)",
 	Short:   uploadAPIsCmdShortDesc,
 	Long:    uploadAPIsCmdLongDesc,
@@ -47,13 +48,13 @@ var UploadAPIsCmd = &cobra.Command{
 		if err != nil {
 			utils.HandleErrorAndExit("Error getting credentials", err)
 		}
-		executeUploadAPIsCmd(cred, token)
+		executeUploadAPIsCmd(cred, token, endpoint)
 	},
 }
 
 // Do operations to upload APIs to the vector database
-func executeUploadAPIsCmd(credential credentials.Credential, token string) {
-	impl.UploadAPIs(credential, CmdUploadEnvironment, CmdResourceTenantDomain, CmdUsername, token)
+func executeUploadAPIsCmd(credential credentials.Credential, token, endpoint string) {
+	impl.UploadAPIs(credential, CmdUploadEnvironment, CmdResourceTenantDomain, CmdUsername, token, endpoint)
 }
 
 func init() {
@@ -61,6 +62,8 @@ func init() {
 	UploadAPIsCmd.Flags().StringVarP(&CmdUploadEnvironment, "environment", "e",
 		"", "Environment from which the APIs should be uploaded")
 	UploadAPIsCmd.Flags().StringVarP(&token, "token", "", "", "on-prem-key of the organization")
+	UploadAPIsCmd.Flags().StringVarP(&endpoint, "endpoint", "", "", "endpoint of the marketplace assistant service")
 	_ = UploadAPIsCmd.MarkFlagRequired("environment")
 	_ = UploadAPIsCmd.MarkFlagRequired("token")
+	_ = UploadAPIsCmd.MarkFlagRequired("endpoint")
 }
