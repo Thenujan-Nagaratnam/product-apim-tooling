@@ -25,7 +25,7 @@ import (
 
 // Upload command related usage Info
 const UploadCmdLiteral = "upload"
-const UploadCmdShortDesc = "Upload APIs/API Products in an environment to a vector database for providing context to the marketplace assistant."
+const UploadCmdShortDesc = "Upload APIs and API Products in an environment to a vector database to provide context to the marketplace assistant."
 const UploadCmdLongDesc = `Upload APIs and API Products available in the environment specified by flag (--environment, -e)`
 const UploadCmdExamples = utils.ProjectName + ` ` + UploadCmdLiteral + ` ` + UploadAPIsCmdLiteral + ` --token <on-prem-key> -e dev`
 

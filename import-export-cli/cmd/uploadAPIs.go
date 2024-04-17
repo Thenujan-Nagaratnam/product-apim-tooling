@@ -28,8 +28,8 @@ import (
 const UploadAPIsCmdLiteral = "apis"
 const uploadAPIsCmdShortDesc = "Upload APIs for migration"
 
-const uploadAPIsCmdLongDesc = "Upload APIs/API Products in an environment to a vector database for providing context to the marketplace assistant."
-const UploadAPIsCmdLongDesc = `Upload APIs and API Products available in the environment specified by flag (--environment, -e)`
+const uploadAPIsCmdLongDesc = "Upload public APIs and API Products in an environment to a vector database to provide context to the marketplace assistant."
+const UploadAPIsCmdLongDesc = `Upload public APIs and API Products available in the environment specified by flag (--environment, -e)`
 const uploadAPIsCmdExamples = utils.ProjectName + ` ` + UploadCmdLiteral + ` ` + UploadAPIsCmdLiteral + ` --token <on-prem-key> -e dev`
 
 var token string
@@ -51,49 +51,10 @@ var UploadAPIsCmd = &cobra.Command{
 	},
 }
 
-// Do operations to upload APIs for the migration into the directory passed as UploadDirectory
-// <upload_directory> is the patch defined in main_config.yaml
-// uploadDirectory = <upload_directory>/migration/
+// Do operations to upload APIs to the vector database
 func executeUploadAPIsCmd(credential credentials.Credential, token string) {
-
-	// exportRelatedFilesPath := filepath.Join(exportDirectory, CmdUploadEnvironment,
-	// 	utils.GetMigrationExportTenantDirName(CmdResourceTenantDomain))
-	// //e.g. /home/samithac/.wso2apictl/exported/migration/production-2.5/wso2-dot-org
-	// startFromBeginning = true
-	// isProcessCompleted = false
-
-	// apiListOffset = 0
-	// startingApiIndexFromList = 0
-	// count, apis = getAPIList(credential, CmdUploadEnvironment, CmdResourceTenantDomain)
-
-	// // impl.PrepareStartFromBeginning(credential, exportRelatedFilesPath, CmdResourceTenantDomain, CmdUsername, CmdUploadEnvironment)
-
-	// fmt.Println("Uploading APIs for the marketplace assistant...")
-
 	impl.UploadAPIs(credential, CmdUploadEnvironment, CmdResourceTenantDomain, CmdUsername, token)
 }
-
-// // Get the list of APIs from the defined offset index, upto the limit of constant value utils.MaxAPIsToExportOnce
-// func getAPIList(credential credentials.Credential, cmdExportEnvironment, cmdResourceTenantDomain string) (count int32, apis []utils.API) {
-// 	accessToken, preCommandErr := credentials.GetOAuthAccessToken(credential, cmdExportEnvironment)
-// 	if preCommandErr == nil {
-// 		apiListEndpoint := utils.GetApiListEndpointOfEnv(cmdExportEnvironment, utils.MainConfigFilePath)
-// 		apiListEndpoint += "?limit=" + strconv.Itoa(utils.MaxAPIsToExportOnce) + "&offset=" + strconv.Itoa(apiListOffset)
-// 		if cmdResourceTenantDomain != "" {
-// 			apiListEndpoint += "&tenantDomain=" + cmdResourceTenantDomain
-// 		}
-// 		count, apis, err := impl.GetAPIList(accessToken, apiListEndpoint, "", "")
-// 		if err == nil {
-// 			return count, apis
-// 		} else {
-// 			utils.HandleErrorAndExit(utils.LogPrefixError+"Getting List of APIs.", utils.GetHttpErrorResponse(err))
-// 		}
-// 	} else {
-// 		utils.HandleErrorAndExit(utils.LogPrefixError+"Error in getting access token for user while getting "+
-// 			"the list of APIs: ", preCommandErr)
-// 	}
-// 	return 0, nil
-// }
 
 func init() {
 	UploadCmd.AddCommand(UploadAPIsCmd)

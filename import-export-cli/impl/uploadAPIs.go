@@ -21,7 +21,6 @@ package impl
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"strconv"
 	"time"
@@ -45,16 +44,19 @@ func UploadAPIs(credential credentials.Credential, cmdUploadEnvironment string, 
 		devPortalEndpoint := utils.GetDevPortalEndpointOfEnv(cmdUploadEnvironment, utils.MainConfigFilePath)
 		headers := make(map[string]string)
 		headers["API-KEY"] = onPremKey
-		fmt.Println("Removing existing APIs..!")
+		fmt.Println("Removing existing APIs from vector DB..!")
 		resp, err := utils.InvokeDELETERequest("http://localhost:9090/ai/spec-populator/bulk-remove", headers)
 
 		if err != nil {
+			utils.HandleErrorAndExit("Error in removing existing APIs: ", err)
 			return
 		}
 
 		if resp.StatusCode() == http.StatusOK {
-			fmt.Println("Uploading APIs...")
+			fmt.Println("Uploading APIs to vector DB...")
 			getTenants(devPortalEndpoint, "tenants?state=active&limit=100&offset=0")
+		} else if resp.StatusCode() == http.StatusUnauthorized {
+			fmt.Println("Error in removing existing APIs: ", string(resp.Body()))
 		}
 	} else {
 		fmt.Println("Error getting OAuth Tokens : " + preCommandErr.Error())
@@ -69,6 +71,7 @@ func getTenants(devPortalEndpoint, next string) {
 	resp, err := InvokeGETRequest(requestURL, "")
 
 	if err != nil {
+		utils.HandleErrorAndExit("Error in getting tenants: ", err)
 		return
 	}
 
@@ -114,7 +117,8 @@ func getAPIInfo(devPortalEndpoint, tenant, next string) {
 	resp, err := utils.InvokeGETRequest(requestURL, headers)
 
 	if err != nil {
-		fmt.Println("Error in getting APIs: ", err)
+		utils.HandleErrorAndExit("Error in getting APIInfo: ", err)
+		return
 	}
 
 	apiListResponse := &utils.UploadAPIListResponse{}
@@ -154,21 +158,24 @@ func upload(devPortalEndpoint string, tenant string, apiList []utils.UploadAPI) 
 			requestURL := devPortalEndpoint + "apis/" + apiList[i].ID + "/swagger"
 			resp, err := InvokeGETRequest(requestURL, tenant)
 			if err != nil {
-				fmt.Println("Error in sending request: ", err)
+				utils.HandleErrorAndExit("Error in getting API swagger definition: ", err)
+				return
 			}
 			api["api_spec"] = resp.String()
 		} else if apiList[i].Type == "GRAPHQL" {
 			requestURL := devPortalEndpoint + "apis/" + apiList[i].ID + "/graphql-schema"
 			resp, err := InvokeGETRequest(requestURL, tenant)
 			if err != nil {
-				fmt.Println("Error in sending request: ", err)
+				utils.HandleErrorAndExit("Error in getting API asynch definition: ", err)
+				return
 			}
 			api["async_spec"] = resp.String()
 		} else if apiList[i].Type == "WS" || apiList[i].Type == "WEBSUB" || apiList[i].Type == "ASYNC" || apiList[i].Type == "SSE" || apiList[i].Type == "WEBHOOK" {
 			requestURL := devPortalEndpoint + "apis/" + apiList[i].ID + "/async-api-specification"
 			resp, err := InvokeGETRequest(requestURL, tenant)
 			if err != nil {
-				fmt.Println("Error in sending request: ", err)
+				utils.HandleErrorAndExit("Error in getting API graphql definition: ", err)
+				return
 			}
 			api["sdl_schema"] = resp.String()
 		} else {
@@ -195,13 +202,13 @@ func InvokePOSTRequest(payload []map[string]string) {
 	go func(payload []map[string]string) {
 		jsonData, err := json.Marshal(map[string]interface{}{"apis": payload})
 		if err != nil {
-			log.Fatal(err)
+			utils.HandleErrorAndExit("Error in marshalling payload: ", err)
 		}
 		headers := make(map[string]string)
 		headers["API-KEY"] = onPremKey
 		headers[utils.HeaderContentType] = utils.HeaderValueApplicationJSON
 
-		resp, err := utils.InvokePOSTRequest("http://localhost:9090/ai/spec-populator/bulk-upload", headers, jsonData)
+		resp, err := utils.InvokePOSTRequest("http://localhost:9000/ai/spec-populator/bulk-upload", headers, jsonData)
 
 		if err != nil {
 			utils.HandleErrorAndExit("API upload failed. Reason: ", err)
