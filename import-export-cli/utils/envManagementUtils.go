@@ -401,7 +401,7 @@ func GetDefaultEnvironment(mainConfigFilePath string) string {
 	return ""
 }
 
-// get default token endpoint given from an apim endpoint
+//get default token endpoint given from an apim endpoint
 // @param apimEndpoint : Endpoint URL of the apim endpoint
 func GetTokenEndPointFromAPIMEndpoint(apimEndpoint string) string {
 	if strings.HasSuffix(apimEndpoint, "/") {
@@ -411,7 +411,7 @@ func GetTokenEndPointFromAPIMEndpoint(apimEndpoint string) string {
 	}
 }
 
-// get default token endpoint given from a publisher endpoint
+//get default token endpoint given from a publisher endpoint
 // @param publisherEndpoint : Endpoint URL of the publisher endpoint
 func GetTokenEndPointFromPublisherEndpoint(publisherEndpoint string) string {
 	if strings.Contains(publisherEndpoint, defaultPublisherApiImportExportSuffix) {
@@ -443,10 +443,10 @@ func GetInternalTokenEndpointOfEnv(env, filePath string) string {
 	return internalTokenEndpoint
 }
 
-// Get token endpoint for Token revocation
+//Get token endpoint for Token revocation
 // @param env : Name of the environment
 // @param filePath : Path to file where tokens are stored
-// @return endpoint URL of token revocation endpoint
+//@return endpoint URL of token revocation endpoint
 func GetTokenRevokeEndpoint(env, filePath string) string {
 	//Get Internal token endpoint for the environment
 	internalTokenEndpoint := GetInternalTokenEndpointOfEnv(env, filePath)
