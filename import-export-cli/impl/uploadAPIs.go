@@ -49,7 +49,7 @@ func removeExistingAPIs() error {
 		}
 
 		if resp.StatusCode() != 200 {
-			fmt.Printf("Removing existing APIs failed with status %d (attempt %d)\n", resp.StatusCode(), attempt)
+			fmt.Printf("Removing existing APIs failed with status %d %s (attempt %d)\n", resp.StatusCode(), resp.Body(), attempt)
 			continue
 		}
 
@@ -76,13 +76,13 @@ func UploadAPIs(credential credentials.Credential, cmdUploadEnvironment string, 
 		utils.HandleErrorAndExit("Error in removing existing APIs", err)
 	}
 
-	fmt.Println("Uploading APIs to vector DB...")
+	fmt.Println("Uploading public APIs to vector DB...")
 
 	payloadQueue := make(chan []map[string]string, 2)
 
 	go produceAPIPayloads(devPortalEndpoint, payloadQueue)
 
-	numConsumers := 2
+	numConsumers := 1
 	var wg sync.WaitGroup
 	for i := 0; i < numConsumers; i++ {
 		wg.Add(1)
@@ -91,7 +91,7 @@ func UploadAPIs(credential credentials.Credential, cmdUploadEnvironment string, 
 
 	wg.Wait()
 
-	fmt.Printf("\n%d APIs uploaded out of %d APIs.\n", totalAPIs, uploadedAPIs)
+	fmt.Printf("\nTotal number of public APIs present in the API Manager: %d\nTotal number of APIs successfully uploaded: %d\n\n", totalAPIs, uploadedAPIs)
 }
 
 func InvokeGETRequest(requestURL, tenant string) (*resty.Response, error) {
@@ -108,10 +108,10 @@ func produceAPIPayloads(devPortalEndpoint string, payloadQueue chan<- []map[stri
 	close(payloadQueue)
 }
 
-func processTenants(devPortalEndpoint, next string, payloadQueue chan<- []map[string]string) {
+func processTenants(devPortalEndpoint, endpointPath string, payloadQueue chan<- []map[string]string) {
 	devPortalEndpoint = utils.AppendSlashToString(devPortalEndpoint)
 
-	requestURL := devPortalEndpoint + next
+	requestURL := devPortalEndpoint + endpointPath
 	resp, err := InvokeGETRequest(requestURL, "")
 	if err != nil {
 		fmt.Println("Error in getting tenants:", err)
@@ -128,12 +128,13 @@ func processTenants(devPortalEndpoint, next string, payloadQueue chan<- []map[st
 	tenantCount := tenantListResponse.Pagination.Total
 	if tenantCount == 0 {
 		// Handle carbon.super tenant
-		processAPIs(devPortalEndpoint, utils.DefaultTenantDomain, "apis?limit=50&offset=0", payloadQueue)
+		fmt.Println("Processing tenant:", utils.DefaultTenantDomain)
+		processAPIs(devPortalEndpoint, utils.DefaultTenantDomain, "apis?limit=100&offset=0", payloadQueue)
 	} else {
 		// Handle all tenants
 		for _, tenant := range tenantListResponse.List {
 			fmt.Println("Processing tenant:", tenant.Domain)
-			processAPIs(devPortalEndpoint, tenant.Domain, "apis?limit=50&offset=0", payloadQueue)
+			processAPIs(devPortalEndpoint, tenant.Domain, "apis?limit=100&offset=0", payloadQueue)
 		}
 	}
 
@@ -142,8 +143,8 @@ func processTenants(devPortalEndpoint, next string, payloadQueue chan<- []map[st
 	}
 }
 
-func processAPIs(devPortalEndpoint, tenant, next string, payloadQueue chan<- []map[string]string) {
-	requestURL := devPortalEndpoint + next
+func processAPIs(devPortalEndpoint, tenant, endpointPath string, payloadQueue chan<- []map[string]string) {
+	requestURL := devPortalEndpoint + endpointPath
 
 	resp, err := InvokeGETRequest(requestURL, tenant)
 	if err != nil {
@@ -156,7 +157,7 @@ func processAPIs(devPortalEndpoint, tenant, next string, payloadQueue chan<- []m
 		utils.HandleErrorAndContinue("Error unmarshalling API list response:", err)
 	}
 
-	atomic.AddInt32(&totalAPIs, apiListResponse.Pagination.Total)
+	atomic.AddInt32(&totalAPIs, apiListResponse.Count)
 
 	payload := []map[string]string{}
 
@@ -202,6 +203,10 @@ func processAPIs(devPortalEndpoint, tenant, next string, payloadQueue chan<- []m
 
 	}
 	payloadQueue <- payload
+
+	if apiListResponse.Pagination.Next != "" {
+		processAPIs(devPortalEndpoint, tenant, apiListResponse.Pagination.Next, payloadQueue)
+	}
 }
 
 func consumeAPIPayloads(payloadQueue <-chan []map[string]string, wg *sync.WaitGroup) {
@@ -213,7 +218,7 @@ func consumeAPIPayloads(payloadQueue <-chan []map[string]string, wg *sync.WaitGr
 }
 
 func InvokePOSTRequest(payload []map[string]string) {
-	fmt.Printf("Sending post request for %d APIs for tenant: %s\n", len(payload), payload[0]["tenant_domain"])
+	fmt.Printf("Uploading %d APIs for tenant: %s\n", len(payload), payload[0]["tenant_domain"])
 	jsonData, err := json.Marshal(map[string]interface{}{"apis": payload})
 	if err != nil {
 		utils.HandleErrorAndContinue("Error in marshalling payload:", err)
@@ -234,7 +239,7 @@ func InvokePOSTRequest(payload []map[string]string) {
 		}
 
 		if resp.StatusCode() != 200 {
-			fmt.Printf("API upload failed with status %d (attempt %d).\n", resp.StatusCode(), attempt)
+			fmt.Printf("API upload failed with status %d %s (attempt %d).\n", resp.StatusCode(), resp.Body(), attempt)
 			continue
 		}
 
