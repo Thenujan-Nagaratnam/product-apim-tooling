@@ -78,10 +78,13 @@ func UploadAPIs(credential credentials.Credential, cmdUploadEnvironment string, 
 
 	fmt.Println("Uploading public APIs to vector DB...")
 
-	payloadQueue := make(chan []map[string]string, 2)
+	// buffered channel with 10 slots
+	payloadQueue := make(chan []map[string]string, 10)
 
+	// producer
 	go produceAPIPayloads(devPortalEndpoint, payloadQueue)
 
+	// consumer
 	numConsumers := 1
 	var wg sync.WaitGroup
 	for i := 0; i < numConsumers; i++ {
@@ -138,6 +141,7 @@ func processTenants(devPortalEndpoint, endpointPath string, payloadQueue chan<- 
 		}
 	}
 
+	// Process next set of tenants
 	if tenantListResponse.Pagination.Next != "" {
 		processTenants(devPortalEndpoint, tenantListResponse.Pagination.Next, payloadQueue)
 	}
@@ -157,6 +161,7 @@ func processAPIs(devPortalEndpoint, tenant, endpointPath string, payloadQueue ch
 		utils.HandleErrorAndContinue("Error unmarshalling API list response:", err)
 	}
 
+	// Update totalAPIs count
 	atomic.AddInt32(&totalAPIs, apiListResponse.Count)
 
 	payload := []map[string]string{}
@@ -204,6 +209,7 @@ func processAPIs(devPortalEndpoint, tenant, endpointPath string, payloadQueue ch
 	}
 	payloadQueue <- payload
 
+	// Process next set of APIs
 	if apiListResponse.Pagination.Next != "" {
 		processAPIs(devPortalEndpoint, tenant, apiListResponse.Pagination.Next, payloadQueue)
 	}
@@ -239,12 +245,21 @@ func InvokePOSTRequest(payload []map[string]string) {
 		}
 
 		if resp.StatusCode() != 200 {
-			fmt.Printf("API upload failed with status %d %s (attempt %d).\n", resp.StatusCode(), resp.Body(), attempt)
+			fmt.Printf("Failed to upload %d APIs for tenant %s with status %d %s (attempt %d).\n", len(payload), payload[0]["tenant_domain"], resp.StatusCode(), resp.Body(), attempt)
+			continue
+		}
+
+		jsonResp := map[string]map[string]int32{}
+
+		err := json.Unmarshal(resp.Body(), &jsonResp)
+
+		if err != nil {
+			utils.HandleErrorAndContinue("Error in unmarshalling response:", err)
 			continue
 		}
 
 		fmt.Printf("%d APIs uploaded successfully for tenant: %s (attempt %d)\n", len(payload), payload[0]["tenant_domain"], attempt)
-		atomic.AddInt32(&uploadedAPIs, int32(len(payload)))
+		atomic.AddInt32(&uploadedAPIs, jsonResp["message"]["upsert_count"])
 		break
 	}
 
