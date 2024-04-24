@@ -85,7 +85,7 @@ func UploadAPIs(credential credentials.Credential, cmdUploadEnvironment string, 
 	go produceAPIPayloads(devPortalEndpoint, payloadQueue)
 
 	// consumer
-	numConsumers := 1
+	numConsumers := 2
 	var wg sync.WaitGroup
 	for i := 0; i < numConsumers; i++ {
 		wg.Add(1)
@@ -132,12 +132,12 @@ func processTenants(devPortalEndpoint, endpointPath string, payloadQueue chan<- 
 	if tenantCount == 0 {
 		// Handle carbon.super tenant
 		fmt.Println("Processing tenant:", utils.DefaultTenantDomain)
-		processAPIs(devPortalEndpoint, utils.DefaultTenantDomain, "apis?limit=100&offset=0", payloadQueue)
+		processAPIs(devPortalEndpoint, utils.DefaultTenantDomain, "apis?limit=5&offset=0", payloadQueue)
 	} else {
 		// Handle all tenants
 		for _, tenant := range tenantListResponse.List {
 			fmt.Println("Processing tenant:", tenant.Domain)
-			processAPIs(devPortalEndpoint, tenant.Domain, "apis?limit=100&offset=0", payloadQueue)
+			processAPIs(devPortalEndpoint, tenant.Domain, "apis?limit=5&offset=0", payloadQueue)
 		}
 	}
 
