@@ -143,6 +143,7 @@ func createConfigFiles() {
 	if !utils.IsFileExist(utils.MainConfigFilePath) {
 		var mainConfig = new(utils.MainConfig)
 		mainConfig.Config = utils.Config{HttpRequestTimeout: utils.DefaultHttpRequestTimeout,
+			MarketplaceAssistantThreadSize: utils.DefaultMarketplaceAssistantThreadSize,
 			ExportDirectory:      utils.DefaultExportDirPath,
 			KubernetesMode:       k8sUtils.DefaultKubernetesMode,
 			TokenType:            utils.DefaultTokenType,

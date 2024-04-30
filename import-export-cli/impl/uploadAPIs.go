@@ -21,6 +21,8 @@ package impl
 import (
 	"encoding/json"
 	"fmt"
+	"regexp"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -79,13 +81,14 @@ func UploadAPIs(credential credentials.Credential, cmdUploadEnvironment string, 
 	fmt.Println("Uploading public APIs to vector DB...")
 
 	// buffered channel with 10 slots
-	payloadQueue := make(chan []map[string]string, 10)
+	payloadQueue := make(chan []map[string]interface{}, 10)
 
 	// producer
 	go produceAPIPayloads(devPortalEndpoint, payloadQueue)
 
 	// consumer
-	numConsumers := 2
+	numConsumers := utils.MarketplaceAssistantThreadSize
+	fmt.Println("Number of Threads:", numConsumers)
 	var wg sync.WaitGroup
 	for i := 0; i < numConsumers; i++ {
 		wg.Add(1)
@@ -106,12 +109,12 @@ func InvokeGETRequest(requestURL, tenant string) (*resty.Response, error) {
 	return utils.InvokeGETRequest(requestURL, headers)
 }
 
-func produceAPIPayloads(devPortalEndpoint string, payloadQueue chan<- []map[string]string) {
+func produceAPIPayloads(devPortalEndpoint string, payloadQueue chan<- []map[string]interface{}) {
 	processTenants(devPortalEndpoint, "tenants?state=active&limit=100&offset=0", payloadQueue)
 	close(payloadQueue)
 }
 
-func processTenants(devPortalEndpoint, endpointPath string, payloadQueue chan<- []map[string]string) {
+func processTenants(devPortalEndpoint, endpointPath string, payloadQueue chan<- []map[string]interface{}) {
 	devPortalEndpoint = utils.AppendSlashToString(devPortalEndpoint)
 
 	requestURL := devPortalEndpoint + endpointPath
@@ -147,7 +150,7 @@ func processTenants(devPortalEndpoint, endpointPath string, payloadQueue chan<- 
 	}
 }
 
-func processAPIs(devPortalEndpoint, tenant, endpointPath string, payloadQueue chan<- []map[string]string) {
+func processAPIs(devPortalEndpoint, tenant, endpointPath string, payloadQueue chan<- []map[string]interface{}) {
 	requestURL := devPortalEndpoint + endpointPath
 
 	resp, err := InvokeGETRequest(requestURL, tenant)
@@ -164,10 +167,10 @@ func processAPIs(devPortalEndpoint, tenant, endpointPath string, payloadQueue ch
 	// Update totalAPIs count
 	atomic.AddInt32(&totalAPIs, apiListResponse.Count)
 
-	payload := []map[string]string{}
+	payload := []map[string]interface{}{}
 
 	for _, api := range apiListResponse.List {
-		apiPayload := map[string]string{
+		apiPayload := map[string]interface{}{
 			"uuid":          api.ID,
 			"description":   api.Description,
 			"api_name":      api.Name,
@@ -182,6 +185,7 @@ func processAPIs(devPortalEndpoint, tenant, endpointPath string, payloadQueue ch
 			swaggerResp, err := InvokeGETRequest(requestURL, tenant)
 			if err == nil {
 				apiPayload["api_spec"] = swaggerResp.String()
+				apiPayload["reduced_spec"] = reduceOpenAPISpec(swaggerResp.String())
 			} else {
 				utils.HandleErrorAndContinue("Error in getting swagger for API: "+api.ID, err)
 			}
@@ -191,6 +195,7 @@ func processAPIs(devPortalEndpoint, tenant, endpointPath string, payloadQueue ch
 			schemaResp, err := InvokeGETRequest(requestURL, tenant)
 			if err == nil {
 				apiPayload["sdl_schema"] = schemaResp.String()
+				apiPayload["reduced_spec"] = reduceGraphQLSchema(schemaResp.String())
 			} else {
 				utils.HandleErrorAndContinue("Error in getting Graphql schema for API: "+api.ID, err)
 			}
@@ -200,6 +205,7 @@ func processAPIs(devPortalEndpoint, tenant, endpointPath string, payloadQueue ch
 			asyncResp, err := InvokeGETRequest(requestURL, tenant)
 			if err == nil {
 				apiPayload["async_spec"] = asyncResp.String()
+				apiPayload["reduced_spec"] = reduceAsyncAPISpec(asyncResp.String())
 			} else {
 				utils.HandleErrorAndContinue("Error in getting async spec for API: "+api.ID, err)
 			}
@@ -215,7 +221,7 @@ func processAPIs(devPortalEndpoint, tenant, endpointPath string, payloadQueue ch
 	}
 }
 
-func consumeAPIPayloads(payloadQueue <-chan []map[string]string, wg *sync.WaitGroup) {
+func consumeAPIPayloads(payloadQueue <-chan []map[string]interface{}, wg *sync.WaitGroup) {
 	defer wg.Done()
 
 	for payload := range payloadQueue {
@@ -223,7 +229,7 @@ func consumeAPIPayloads(payloadQueue <-chan []map[string]string, wg *sync.WaitGr
 	}
 }
 
-func InvokePOSTRequest(payload []map[string]string) {
+func InvokePOSTRequest(payload []map[string]interface{}) {
 	fmt.Printf("Uploading %d APIs for tenant: %s\n", len(payload), payload[0]["tenant_domain"])
 	jsonData, err := json.Marshal(map[string]interface{}{"apis": payload})
 	if err != nil {
@@ -266,4 +272,107 @@ func InvokePOSTRequest(payload []map[string]string) {
 	if uploadErr != nil {
 		utils.HandleErrorAndContinue("API upload failed after retry. Reason: ", uploadErr)
 	}
+}
+
+func reduceAsyncAPISpec(specString string) map[string]interface{} {
+	spec := make(map[string]interface{})
+	err := json.Unmarshal([]byte(specString), &spec)
+	if err != nil {
+		utils.HandleErrorAndExit("Error in unmarshalling AsyncAPI spec", err)
+	}
+
+	title := spec["info"].(map[string]interface{})["title"].(string)
+	description := spec["info"].(map[string]interface{})["description"].(string)
+
+	channels := make([]string, 0)
+	for channelName, channel := range spec["channels"].(map[string]interface{}) {
+		description := ""
+		if channel.(map[string]interface{})["description"] != nil {
+			description = channel.(map[string]interface{})["description"].(string)
+		}
+		channel := fmt.Sprintf("(\"%s\", \"%s\")", channelName, description)
+		channels = append(channels, channel)
+	}
+
+	return map[string]interface{}{
+		"title":       title,
+		"description": description,
+		"channels":    channels,
+	}
+}
+
+func reduceOpenAPISpec(specString string) map[string]interface{} {
+
+	spec := make(map[string]interface{})
+	err := json.Unmarshal([]byte(specString), &spec)
+	if err != nil {
+		utils.HandleErrorAndExit("Error in unmarshalling OpenAPI spec", err)
+	}
+
+	title := ""
+	if spec["info"].(map[string]interface{})["title"] != nil {
+		title = spec["info"].(map[string]interface{})["title"].(string)
+	}
+
+	description := ""
+	if spec["info"].(map[string]interface{})["description"] != nil {
+		description = spec["info"].(map[string]interface{})["description"].(string)
+	}
+
+	endpoints := make([]string, 0)
+	for route, operation := range spec["paths"].(map[string]interface{}) {
+		for operationName, docs := range operation.(map[string]interface{}) {
+			if operationName == "get" || operationName == "post" || operationName == "patch" || operationName == "delete" || operationName == "put" {
+				description := ""
+				if docs.(map[string]interface{})["description"] != nil {
+					description = docs.(map[string]interface{})["description"].(string)
+				} else if docs.(map[string]interface{})["summary"] != nil {
+					description = docs.(map[string]interface{})["summary"].(string)
+				}
+				endpoint := fmt.Sprintf("%s %s %s", strings.ToUpper(operationName), route, description)
+
+				endpoints = append(endpoints, endpoint)
+			}
+		}
+	}
+
+	return map[string]interface{}{
+		"title":       title,
+		"description": description,
+		"endpoints":   endpoints,
+	}
+}
+
+func reduceGraphQLSchema(schemaText string) map[string]string {
+	re := regexp.MustCompile(`\s+`)
+	schemaText = re.ReplaceAllString(schemaText, " ")
+
+	queries := ""
+	mutations := ""
+	subscriptions := ""
+
+	reQueries := regexp.MustCompile(`type Query {([^}]*)`)
+	reMutations := regexp.MustCompile(`type Mutation {([^}]*)`)
+	reSubscriptions := regexp.MustCompile(`type Subscription {([^}]*)`)
+
+	matchQueries := reQueries.FindStringSubmatch(schemaText)
+	matchMutations := reMutations.FindStringSubmatch(schemaText)
+	matchSubscriptions := reSubscriptions.FindStringSubmatch(schemaText)
+
+	if len(matchQueries) > 1 {
+		queries = matchQueries[1]
+	}
+	if len(matchMutations) > 1 {
+		mutations = matchMutations[1]
+	}
+	if len(matchSubscriptions) > 1 {
+		subscriptions = matchSubscriptions[1]
+	}
+
+	return map[string]string{
+		"Queries":       strings.TrimSpace(queries),
+		"Mutations":     strings.TrimSpace(mutations),
+		"Subscriptions": strings.TrimSpace(subscriptions),
+	}
+
 }
