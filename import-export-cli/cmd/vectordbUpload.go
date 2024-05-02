@@ -27,7 +27,7 @@ import (
 const UploadCmdLiteral = "upload"
 const UploadCmdShortDesc = "Upload APIs and API Products in an environment to a vector database to provide context to the marketplace assistant."
 const UploadCmdLongDesc = `Upload APIs and API Products available in the environment specified by flag (--environment, -e)`
-const UploadCmdExamples = utils.ProjectName + ` ` + UploadCmdLiteral + ` ` + UploadAPIsCmdLiteral + ` --token <on-prem-key> -e dev`
+const UploadCmdExamples = utils.ProjectName + ` ` + UploadCmdLiteral + ` ` + UploadAPIsCmdLiteral + ` --token <on-prem-key> --endpoint <endpoint> -e dev`
 
 // UploadCmd represents the Upload command
 var UploadCmd = &cobra.Command{

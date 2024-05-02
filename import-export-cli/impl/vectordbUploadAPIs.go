@@ -34,7 +34,7 @@ var uploadedAPIs int32
 var totalAPIs int32
 var endpoint string
 
-func removeExistingAPIs() error {
+func RemoveExistingAPIs() error {
 	headers := make(map[string]string)
 	headers["API-KEY"] = onPremKey
 
@@ -53,7 +53,16 @@ func removeExistingAPIs() error {
 			continue
 		}
 
-		fmt.Printf("Existing APIs removed successfully (attempt %d)\n", attempt)
+		jsonResp := map[string]map[string]int32{}
+
+		err := json.Unmarshal(resp.Body(), &jsonResp)
+
+		if err != nil {
+			utils.HandleErrorAndContinue("Error in unmarshalling response:", err)
+			continue
+		}
+
+		fmt.Printf("Removed %d APIs successfully from vector database (attempt %d)\n", jsonResp["message"]["delete_count"], attempt)
 		return nil
 	}
 
@@ -63,7 +72,7 @@ func removeExistingAPIs() error {
 	return fmt.Errorf("Removing existing APIs failed after retry")
 }
 
-func UploadAPIs(credential credentials.Credential, cmdUploadEnvironment string, cmdResourceTenantDomain string, cmdUsername, authToken, endpointUrl string) {
+func UploadAPIs(credential credentials.Credential, cmdUploadEnvironment, authToken, endpointUrl string) {
 
 	onPremKey = authToken
 	endpoint = endpointUrl
@@ -71,7 +80,7 @@ func UploadAPIs(credential credentials.Credential, cmdUploadEnvironment string, 
 	devPortalEndpoint := utils.GetDevPortalEndpointOfEnv(cmdUploadEnvironment, utils.MainConfigFilePath)
 
 	fmt.Println("Removing existing APIs from vector DB..!")
-	err := removeExistingAPIs()
+	err := RemoveExistingAPIs()
 	if err != nil {
 		utils.HandleErrorAndExit("Error in removing existing APIs", err)
 	}
@@ -82,14 +91,14 @@ func UploadAPIs(credential credentials.Credential, cmdUploadEnvironment string, 
 	apiListQueue := make(chan []map[string]interface{}, 10)
 
 	// producer
-	go produceAPIPayloads(devPortalEndpoint, apiListQueue)
+	go ProduceAPIPayloads(devPortalEndpoint, apiListQueue)
 
 	// consumer
 	numConsumers := 3
 	var wg sync.WaitGroup
 	for i := 0; i < numConsumers; i++ {
 		wg.Add(1)
-		go consumeAPIPayloads(apiListQueue, &wg)
+		go ConsumeAPIPayloads(apiListQueue, &wg)
 	}
 
 	wg.Wait()
@@ -106,12 +115,12 @@ func InvokeGETRequest(requestURL, tenant string) (*resty.Response, error) {
 	return utils.InvokeGETRequest(requestURL, headers)
 }
 
-func produceAPIPayloads(devPortalEndpoint string, apiListQueue chan<- []map[string]interface{}) {
-	processTenants(devPortalEndpoint, "tenants?state=active&limit=100&offset=0", apiListQueue)
+func ProduceAPIPayloads(devPortalEndpoint string, apiListQueue chan<- []map[string]interface{}) {
+	ProcessTenants(devPortalEndpoint, "tenants?state=active&limit=100&offset=0", apiListQueue)
 	close(apiListQueue)
 }
 // process all the tenants
-func processTenants(devPortalEndpoint, endpointPath string, apiListQueue chan<- []map[string]interface{}) {
+func ProcessTenants(devPortalEndpoint, endpointPath string, apiListQueue chan<- []map[string]interface{}) {
 	devPortalEndpoint = utils.AppendSlashToString(devPortalEndpoint)
 
 	requestURL := devPortalEndpoint + endpointPath
@@ -132,23 +141,23 @@ func processTenants(devPortalEndpoint, endpointPath string, apiListQueue chan<- 
 	if tenantCount == 0 {
 		// Handle carbon.super tenant
 		fmt.Println("Processing tenant:", utils.DefaultTenantDomain)
-		processAPIs(devPortalEndpoint, utils.DefaultTenantDomain, "apis?limit=10&offset=0", apiListQueue)
+		ProcessAPIs(devPortalEndpoint, utils.DefaultTenantDomain, "apis?limit=10&offset=0", apiListQueue)
 	} else {
 		// Handle all tenants
 		for _, tenant := range tenantListResponse.List {
 			fmt.Println("Processing tenant:", tenant.Domain)
-			processAPIs(devPortalEndpoint, tenant.Domain, "apis?limit=10&offset=0", apiListQueue)
+			ProcessAPIs(devPortalEndpoint, tenant.Domain, "apis?limit=10&offset=0", apiListQueue)
 		}
 	}
 
 	// Process next set of tenants
 	if tenantListResponse.Pagination.Next != "" {
-		processTenants(devPortalEndpoint, tenantListResponse.Pagination.Next, apiListQueue)
+		ProcessTenants(devPortalEndpoint, tenantListResponse.Pagination.Next, apiListQueue)
 	}
 }
 
 // process apis in a tenant
-func processAPIs(devPortalEndpoint, tenant, endpointPath string, apiListQueue chan<- []map[string]interface{}) {
+func ProcessAPIs(devPortalEndpoint, tenant, endpointPath string, apiListQueue chan<- []map[string]interface{}) {
 	requestURL := devPortalEndpoint + endpointPath
 
 	resp, err := InvokeGETRequest(requestURL, tenant)
@@ -212,12 +221,12 @@ func processAPIs(devPortalEndpoint, tenant, endpointPath string, apiListQueue ch
 
 	// Process next set of APIs
 	if apiListResponse.Pagination.Next != "" {
-		processAPIs(devPortalEndpoint, tenant, apiListResponse.Pagination.Next, apiListQueue)
+		ProcessAPIs(devPortalEndpoint, tenant, apiListResponse.Pagination.Next, apiListQueue)
 	}
 }
 
 // get apiList from the queue and upload them
-func consumeAPIPayloads(apiListQueue <-chan []map[string]interface{}, wg *sync.WaitGroup) {
+func ConsumeAPIPayloads(apiListQueue <-chan []map[string]interface{}, wg *sync.WaitGroup) {
 	defer wg.Done()
 
 	for apiList := range apiListQueue {

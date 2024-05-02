@@ -49,6 +49,7 @@ var cmdPassword string
 var CmdUsername string
 var CmdExportEnvironment string
 var CmdUploadEnvironment string
+var CmdPurgeEnvironment string
 var CmdResourceTenantDomain string
 var CmdForceStartFromBegin bool
 

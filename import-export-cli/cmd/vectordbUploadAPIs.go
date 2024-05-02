@@ -26,7 +26,7 @@ import (
 )
 
 const UploadAPIsCmdLiteral = "apis"
-const uploadAPIsCmdShortDesc = "Upload APIs for migration"
+const uploadAPIsCmdShortDesc = "Upload APIs and API Products to a vector database."
 
 const uploadAPIsCmdLongDesc = "Upload public APIs and API Products in an environment to a vector database to provide context to the marketplace assistant."
 const UploadAPIsCmdLongDesc = `Upload public APIs and API Products available in the environment specified by flag (--environment, -e)`
@@ -54,7 +54,7 @@ var UploadAPIsCmd = &cobra.Command{
 
 // Do operations to upload APIs to the vector database
 func executeUploadAPIsCmd(credential credentials.Credential, token, endpoint string) {
-	impl.UploadAPIs(credential, CmdUploadEnvironment, CmdResourceTenantDomain, CmdUsername, token, endpoint)
+	impl.UploadAPIs(credential, CmdUploadEnvironment, token, endpoint)
 }
 
 func init() {
