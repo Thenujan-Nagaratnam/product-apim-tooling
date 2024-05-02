@@ -194,7 +194,7 @@ func init() {
 	SetCmd.Flags().IntVar(&flagHttpRequestTimeout, "http-request-timeout", defaultHttpRequestTimeout,
 		"Timeout for HTTP Client")
 	SetCmd.Flags().IntVar(&flagMarketplaceAssistantThreadSize, "marketplace-assistant-thread-count", defaultMarketplaceAssistantThreadSize,
-		"Timeout for HTTP Client")
+		"No of threads to be used by Marketplace Assistant for parallel processing")
 	SetCmd.Flags().StringVar(&flagExportDirectory, "export-directory", defaultExportDirectory,
 		"Path to directory where APIs should be saved")
 	SetCmd.Flags().StringVar(&flagTLSRenegotiationMode, "tls-renegotiation-mode", utils.TLSRenegotiationNever,
