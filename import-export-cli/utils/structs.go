@@ -40,6 +40,7 @@ type MainConfig struct {
 
 type Config struct {
 	HttpRequestTimeout    int    `yaml:"http_request_timeout"`
+	MarketplaceAssistantThreadSize int `yaml:"marketplace_assistant_thread_count"`
 	ExportDirectory       string `yaml:"export_directory"`
 	KubernetesMode        bool   `yaml:"kubernetes_mode"`
 	TokenType             string `yaml:"token_type"`

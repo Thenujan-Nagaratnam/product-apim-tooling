@@ -94,7 +94,7 @@ func UploadAPIs(credential credentials.Credential, cmdUploadEnvironment, authTok
 	go ProduceAPIPayloads(devPortalEndpoint, apiListQueue)
 
 	// consumer
-	numConsumers := 3
+	numConsumers := utils.MarketplaceAssistantThreadSize
 	var wg sync.WaitGroup
 	for i := 0; i < numConsumers; i++ {
 		wg.Add(1)
