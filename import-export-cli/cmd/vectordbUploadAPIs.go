@@ -30,7 +30,8 @@ const uploadAPIsCmdShortDesc = "Upload APIs and API Products to a vector databas
 
 const uploadAPIsCmdLongDesc = "Upload public APIs and API Products in an environment to a vector database to provide context to the marketplace assistant."
 const UploadAPIsCmdLongDesc = `Upload public APIs and API Products available in the environment specified by flag (--environment, -e)`
-const uploadAPIsCmdExamples = utils.ProjectName + ` ` + UploadCmdLiteral + ` ` + UploadAPIsCmdLiteral + `--endpoint <endpoint-url> --token <on-prem-key> -e dev`
+const uploadAPIsCmdExamples = utils.ProjectName + ` ` + UploadCmdLiteral + ` ` + UploadAPIsCmdLiteral + ` --token 2fdca1b6-6a28-4aea-add6-77c97033bdb9 --endpoint https://dev-tools.wso2.com/apim-ai-service -e production 
+							NOTE: All the flags (--token, --endpoint and --environment (-e)) are mandatory`
 
 var token string
 var endpoint string
