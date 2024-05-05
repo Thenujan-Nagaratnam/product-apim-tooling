@@ -20,6 +20,8 @@ package cmd
 
 import (
 	"github.com/spf13/cobra"
+	"github.com/wso2/product-apim-tooling/import-export-cli/credentials"
+	"github.com/wso2/product-apim-tooling/import-export-cli/impl"
 	"github.com/wso2/product-apim-tooling/import-export-cli/utils"
 )
 
@@ -27,7 +29,7 @@ import (
 const PurgeCmdLiteral = "vector-db-purge"
 const PurgeCmdShortDesc = "Purge APIs and API Products available in an environment from the vector database."
 const PurgeCmdLongDesc = `Purge APIs and API Products available in the environment specified by flag (--environment, -e)`
-const PurgeCmdExamples = utils.ProjectName + ` ` + PurgeCmdLiteral + ` ` + PurgeAPIsCmdLiteral + ` --token 2fdca1b6-6a28-4aea-add6-77c97033bdb9 --endpoint https://dev-tools.wso2.com/apim-ai-service -e production 
+const PurgeCmdExamples = utils.ProjectName + ` ` + PurgeCmdLiteral + ` --token 2fdca1b6-6a28-4aea-add6-77c97033bdb9 --endpoint https://dev-tools.wso2.com/apim-ai-service -e production 
 						NOTE: All the flags (--token, --endpoint and --environment (-e)) are mandatory`
 
 // PurgeCmd represents the Purge command
@@ -38,10 +40,28 @@ var PurgeCmd = &cobra.Command{
 	Example: PurgeCmdExamples,
 	Run: func(cmd *cobra.Command, args []string) {
 		utils.Logln(utils.LogPrefixInfo + PurgeCmdLiteral + " called")
+		
+		cred, err := GetCredentials(CmdPurgeEnvironment)
+		if err != nil {
+			utils.HandleErrorAndExit("Error getting credentials", err)
+		}
+		executePurgeCmd(cred, token, endpoint)
 	},
+}
+
+// Do operations to Purge APIs to the vector database
+func executePurgeCmd(credential credentials.Credential, token, endpoint string) {
+	impl.PurgeAPIs(credential, CmdPurgeEnvironment, token, endpoint)
 }
 
 // init using Cobra
 func init() {
 	RootCmd.AddCommand(PurgeCmd)
+	PurgeCmd.Flags().StringVarP(&CmdPurgeEnvironment, "environment", "e",
+		"", "Environment from which the APIs should be Purgeed")
+	PurgeCmd.Flags().StringVarP(&token, "token", "", "", "on-prem-key of the organization")
+	PurgeCmd.Flags().StringVarP(&endpoint, "endpoint", "", "", "endpoint of the marketplace assistant service")
+	_ = PurgeCmd.MarkFlagRequired("environment")
+	_ = PurgeCmd.MarkFlagRequired("token")
+	_ = PurgeCmd.MarkFlagRequired("endpoint")
 }
