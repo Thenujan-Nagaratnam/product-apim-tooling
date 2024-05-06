@@ -26,7 +26,7 @@ import (
 )
 
 // Upload command related usage Info
-const UploadCmdLiteral = "vector-db-upload" // upload
+const UploadCmdLiteral = "vector-db-upload" // ai upload apis, ai upload api-products
 const UploadCmdShortDesc = "Upload APIs and API Products in an environment to a vector database to provide context to the marketplace assistant."
 const UploadCmdLongDesc = `Upload APIs and API Products available in the environment specified by flag (--environment, -e)`
 const UploadCmdExamples = utils.ProjectName + ` ` + UploadCmdLiteral  + ` --token 2fdca1b6-6a28-4aea-add6-77c97033bdb9 --endpoint https://dev-tools.wso2.com/apim-ai-service -e production 

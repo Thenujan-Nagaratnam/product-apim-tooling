@@ -28,7 +28,7 @@ import (
 )
 
 var HttpRequestTimeout = DefaultHttpRequestTimeout
-var MarketplaceAssistantThreadSize = DefaultMarketplaceAssistantThreadSize
+var MarketplaceAssistantThreadCount = DefaultMarketplaceAssistantThreadCount
 var Insecure bool
 var ExportDirectory string
 
@@ -58,8 +58,8 @@ func SetConfigVars(mainConfigFilePath string) error {
 	HttpRequestTimeout = mainConfig.Config.HttpRequestTimeout
 	Logln(LogPrefixInfo + "Setting HttpTimeoutRequest to " + fmt.Sprint(mainConfig.Config.HttpRequestTimeout))
 
-	MarketplaceAssistantThreadSize = mainConfig.Config.MarketplaceAssistantThreadSize
-	Logln(LogPrefixInfo + "Setting MarketplaceAssistantThreadSize to " + fmt.Sprint(mainConfig.Config.MarketplaceAssistantThreadSize))
+	MarketplaceAssistantThreadCount = mainConfig.Config.MarketplaceAssistantThreadCount
+	Logln(LogPrefixInfo + "Setting MarketplaceAssistantThreadCount to " + fmt.Sprint(mainConfig.Config.MarketplaceAssistantThreadCount))
 	
 	ExportDirectory = mainConfig.Config.ExportDirectory
 	Logln(LogPrefixInfo + "Setting ExportDirectory " + mainConfig.Config.ExportDirectory)

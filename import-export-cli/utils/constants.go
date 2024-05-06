@@ -191,7 +191,7 @@ const SearchAndTag = "&"
 // Other
 const DefaultTokenValidityPeriod = 3600
 const DefaultHttpRequestTimeout = 10000
-const DefaultMarketplaceAssistantThreadSize = 3
+const DefaultMarketplaceAssistantThreadCount = 3
 
 // TLSRenegotiationNever : never negotiate
 const TLSRenegotiationNever = "never"

@@ -28,7 +28,7 @@ import (
 )
 
 var flagHttpRequestTimeout int
-var flagMarketplaceAssistantThreadSize int
+var flagMarketplaceAssistantThreadCount int
 var flagExportDirectory string
 var flagKubernetesMode string
 var flagTLSRenegotiationMode string
@@ -94,12 +94,12 @@ func executeSetCmd(mainConfigFilePath string, cmd *cobra.Command) {
 		fmt.Println("Invalid input for flag --http-request-timeout")
 	}
 
-	if flagMarketplaceAssistantThreadSize > 0 {
+	if flagMarketplaceAssistantThreadCount > 0 {
 		//Check whether the provided Http time out value is not equal to default value
-		if flagMarketplaceAssistantThreadSize != configVars.Config.MarketplaceAssistantThreadSize {
-			fmt.Println("Marketplace Assistant Thread Size is set to : ", flagMarketplaceAssistantThreadSize)
+		if flagMarketplaceAssistantThreadCount != configVars.Config.MarketplaceAssistantThreadCount {
+			fmt.Println("Marketplace Assistant Thread Size is set to : ", flagMarketplaceAssistantThreadCount)
 		}
-		configVars.Config.MarketplaceAssistantThreadSize = flagMarketplaceAssistantThreadSize
+		configVars.Config.MarketplaceAssistantThreadCount = flagMarketplaceAssistantThreadCount
 	} else {
 		fmt.Println("Invalid input for flag --marketplace-assistant-thread-count")
 	}
@@ -173,7 +173,7 @@ func init() {
 	RootCmd.AddCommand(SetCmd)
 
 	var defaultHttpRequestTimeout int
-	var defaultMarketplaceAssistantThreadSize int
+	var defaultMarketplaceAssistantThreadCount int
 	var defaultExportDirectory string
 
 	// read current values in file to be passed into default values for flags below
@@ -183,8 +183,8 @@ func init() {
 		defaultHttpRequestTimeout = mainConfig.Config.HttpRequestTimeout
 	}
 
-	if mainConfig.Config.MarketplaceAssistantThreadSize != 0 {
-		defaultMarketplaceAssistantThreadSize = mainConfig.Config.MarketplaceAssistantThreadSize
+	if mainConfig.Config.MarketplaceAssistantThreadCount != 0 {
+		defaultMarketplaceAssistantThreadCount = mainConfig.Config.MarketplaceAssistantThreadCount
 	}
 
 	if mainConfig.Config.ExportDirectory != "" {
@@ -193,7 +193,7 @@ func init() {
 
 	SetCmd.Flags().IntVar(&flagHttpRequestTimeout, "http-request-timeout", defaultHttpRequestTimeout,
 		"Timeout for HTTP Client")
-	SetCmd.Flags().IntVar(&flagMarketplaceAssistantThreadSize, "marketplace-assistant-thread-count", defaultMarketplaceAssistantThreadSize,
+	SetCmd.Flags().IntVar(&flagMarketplaceAssistantThreadCount, "marketplace-assistant-thread-count", defaultMarketplaceAssistantThreadCount,
 		"No of threads to be used by Marketplace Assistant for parallel processing")
 	SetCmd.Flags().StringVar(&flagExportDirectory, "export-directory", defaultExportDirectory,
 		"Path to directory where APIs should be saved")

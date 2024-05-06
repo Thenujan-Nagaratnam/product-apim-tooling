@@ -72,9 +72,9 @@ func RemoveExistingAPIs() error {
 	return fmt.Errorf("Removing existing APIs failed after retry")
 }
 
-func UploadAPIs(credential credentials.Credential, cmdUploadEnvironment, authToken, endpointUrl string) {
+func UploadAPIs(credential credentials.Credential, cmdUploadEnvironment, token, endpointUrl string) {
 
-	onPremKey = authToken
+	onPremKey = token
 	endpoint = endpointUrl
 
 	devPortalEndpoint := utils.GetDevPortalEndpointOfEnv(cmdUploadEnvironment, utils.MainConfigFilePath)
@@ -94,7 +94,7 @@ func UploadAPIs(credential credentials.Credential, cmdUploadEnvironment, authTok
 	go ProduceAPIPayloads(devPortalEndpoint, apiListQueue)
 
 	// consumer
-	numConsumers := utils.MarketplaceAssistantThreadSize
+	numConsumers := utils.MarketplaceAssistantThreadCount
 	var wg sync.WaitGroup
 	for i := 0; i < numConsumers; i++ {
 		wg.Add(1)
@@ -119,6 +119,7 @@ func ProduceAPIPayloads(devPortalEndpoint string, apiListQueue chan<- []map[stri
 	ProcessTenants(devPortalEndpoint, "tenants?state=active&limit=100&offset=0", apiListQueue)
 	close(apiListQueue)
 }
+
 // process all the tenants
 func ProcessTenants(devPortalEndpoint, endpointPath string, apiListQueue chan<- []map[string]interface{}) {
 	devPortalEndpoint = utils.AppendSlashToString(devPortalEndpoint)
