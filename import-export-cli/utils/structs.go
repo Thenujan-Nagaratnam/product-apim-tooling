@@ -39,16 +39,16 @@ type MainConfig struct {
 }
 
 type Config struct {
-	HttpRequestTimeout    int    `yaml:"http_request_timeout"`
-	MarketplaceAssistantThreadSize int `yaml:"marketplace_assistant_thread_count"`
-	ExportDirectory       string `yaml:"export_directory"`
-	KubernetesMode        bool   `yaml:"kubernetes_mode"`
-	TokenType             string `yaml:"token_type"`
-	VCSDeletionEnabled    bool   `yaml:"vcs_deletion_enabled"`
-	VCSConfigFilePath     string `yaml:"vcs_config_file_path"`
-	VCSSourceRepoPath     string `yaml:"vcs_source_repo_path"`
-	VCSDeploymentRepoPath string `yaml:"vcs_deployment_repo_path"`
-	TLSRenegotiationMode  string `yaml:"tls-renegotiation-mode"`
+	HttpRequestTimeout             int    `yaml:"http_request_timeout"`
+	MarketplaceAssistantThreadSize int    `yaml:"marketplace_assistant_thread_count"`
+	ExportDirectory                string `yaml:"export_directory"`
+	KubernetesMode                 bool   `yaml:"kubernetes_mode"`
+	TokenType                      string `yaml:"token_type"`
+	VCSDeletionEnabled             bool   `yaml:"vcs_deletion_enabled"`
+	VCSConfigFilePath              string `yaml:"vcs_config_file_path"`
+	VCSSourceRepoPath              string `yaml:"vcs_source_repo_path"`
+	VCSDeploymentRepoPath          string `yaml:"vcs_deployment_repo_path"`
+	TLSRenegotiationMode           string `yaml:"tls-renegotiation-mode"`
 }
 
 type EnvKeys struct {
@@ -159,13 +159,18 @@ type TenantListResponse struct {
 	Pagination Pagination `json:"pagination"`
 }
 
+type Data struct {
+	Type      string    `json:"type"`
+	UploadAPI UploadAPI `json:"data"`
+}
+
 type UploadAPI struct {
-	ID          string `json:"id"`
-	Name        string `json:"name"`
-	Version     string `json:"version"`
-	Description string `json:"description"`
-	Type        string `json:"type"`
-	Visibility  string `json:"visibility"`
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	Version    string `json:"version"`
+	Type       string `json:"type"`
+	Visibility string `json:"visibility"`
+	Tenant     string `json:"organizationId"`
 }
 
 type UploadAPIListResponse struct {

@@ -39,7 +39,7 @@ var exportAPIsFormat string
 var startingApiIndexFromList int
 var mainConfigFilePath string
 
-//  Prepare resumption of previous-halted export-apis operation
+// Prepare resumption of previous-halted export-apis operation
 func PrepareResumption(credential credentials.Credential, exportRelatedFilesPath, cmdResourceTenantDomain, cmdUsername, cmdExportEnvironment string) {
 	var lastSuceededAPI utils.API
 	lastSuceededAPI = utils.ReadLastSucceededAPIFileData(exportRelatedFilesPath)
@@ -197,7 +197,7 @@ func ExportAPIs(credential credentials.Credential, exportRelatedFilesPath, cmdEx
 	}
 }
 
-//Export the API and archive to zip format
+// Export the API and archive to zip format
 func exportAPIandWriteToZip(api utils.API, revisionNumber, accessToken, cmdExportEnvironment, apiExportDir,
 	exportRelatedFilesPath, exportAPIsFormat string, exportAPIPreserveStatus, runningExportApiCommand bool) {
 

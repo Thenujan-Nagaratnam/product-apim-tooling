@@ -19,6 +19,9 @@
 package cmd
 
 import (
+	"fmt"
+	"path/filepath"
+
 	"github.com/spf13/cobra"
 	"github.com/wso2/product-apim-tooling/import-export-cli/credentials"
 	"github.com/wso2/product-apim-tooling/import-export-cli/impl"
@@ -44,18 +47,28 @@ var UploadAPIsCmd = &cobra.Command{
 	Example: uploadAPIsCmdExamples,
 	Run: func(cmd *cobra.Command, args []string) {
 		utils.Logln(utils.LogPrefixInfo + UploadAPIsCmdLiteral + " called")
+		var artifactExportDirectory = filepath.Join(utils.ExportDirectory, utils.ExportedMigrationArtifactsDirName)
 
 		cred, err := GetCredentials(CmdUploadEnvironment)
 		if err != nil {
 			utils.HandleErrorAndExit("Error getting credentials", err)
 		}
-		executeUploadAPIsCmd(cred, token, endpoint)
+		executeUploadAPIsCmd(cred, token, endpoint, artifactExportDirectory)
 	},
 }
 
 // Do operations to upload APIs to the vector database
-func executeUploadAPIsCmd(credential credentials.Credential, token, endpoint string) {
-	impl.UploadAPIs(credential, CmdUploadEnvironment, token, endpoint)
+func executeUploadAPIsCmd(credential credentials.Credential, token, endpoint, exportDirectory string) {
+	// apiExportDir := impl.CreateExportAPIsDirStructure(exportDirectory, CmdResourceTenantDomain, CmdExportEnvironment,
+	// 	CmdForceStartFromBegin)
+	// exportRelatedFilesPath := filepath.Join(exportDirectory, CmdExportEnvironment,
+	// 	utils.GetMigrationExportTenantDirName(CmdResourceTenantDomain))
+	//e.g. /home/samithac/.wso2apictl/exported/migration/production-2.5/wso2-dot-org
+	startFromBeginning = false
+	isProcessCompleted = false
+
+	fmt.Println("\nExporting APIs for the migration...")
+	impl.UploadAPIs(credential, CmdUploadEnvironment, token, endpoint, CmdUsername, exportAPIPreserveStatus, runningExportApiCommand, exportAPIsAllRevisions)
 }
 
 func init() {
@@ -66,5 +79,4 @@ func init() {
 	UploadAPIsCmd.Flags().StringVarP(&endpoint, "endpoint", "", "", "endpoint of the marketplace assistant service")
 	_ = UploadAPIsCmd.MarkFlagRequired("environment")
 	_ = UploadAPIsCmd.MarkFlagRequired("token")
-	_ = UploadAPIsCmd.MarkFlagRequired("endpoint")
 }

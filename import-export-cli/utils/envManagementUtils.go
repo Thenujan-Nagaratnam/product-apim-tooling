@@ -172,19 +172,6 @@ func GetPublisherEndpointOfEnv(env, filePath string) string {
 	}
 }
 
-// Get PublisherEndpoint of a given environment
-func GetDevPortalEndpointOfEnv(env, filePath string) string {
-	envEndpoints, _ := GetEndpointsOfEnvironment(env, filePath)
-	if !(envEndpoints.DevPortalEndpoint == "" || envEndpoints == nil) {
-		envEndpoints.DevPortalEndpoint = AppendSlashToString(envEndpoints.DevPortalEndpoint)
-		return envEndpoints.DevPortalEndpoint + defaultDevPortalApiImportExportSuffix
-	} else {
-		apiManagerEndpoint := GetApiManagerEndpointOfEnv(env, filePath)
-		apiManagerEndpoint = AppendSlashToString(apiManagerEndpoint)
-		return apiManagerEndpoint + defaultDevPortalApiImportExportSuffix
-	}
-}
-
 // Get AdminEndpoint of a given environment
 func GetAdminEndpointOfEnv(env, filePath string) string {
 	envEndpoints, _ := GetEndpointsOfEnvironment(env, filePath)

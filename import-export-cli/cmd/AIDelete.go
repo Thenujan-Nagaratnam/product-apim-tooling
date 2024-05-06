@@ -23,27 +23,25 @@ import (
 	"github.com/wso2/product-apim-tooling/import-export-cli/utils"
 )
 
-// Upload command related usage Info
-const UploadCmdLiteral = "vector-db-upload" // upload
-const UploadCmdShortDesc = "Upload APIs and API Products in an environment to a vector database to provide context to the marketplace assistant."
-const UploadCmdLongDesc = `Upload APIs and API Products available in the environment specified by flag (--environment, -e)`
-const UploadCmdExamples = utils.ProjectName + ` ` + UploadCmdLiteral + ` ` + UploadAPIsCmdLiteral + ` --token 2fdca1b6-6a28-4aea-add6-77c97033bdb9 --endpoint https://dev-tools.wso2.com/apim-ai-service -e production 
+// Purge command related usage Info
+const PurgeCmdLiteral = "delete"
+const PurgeCmdShortDesc = "Purge APIs and API Products available in an environment from the vector database."
+const PurgeCmdLongDesc = `Purge APIs and API Products available in the environment specified by flag (--environment, -e)`
+const PurgeCmdExamples = utils.ProjectName + ` ` + AiCmdLiteral + ` ` + PurgeCmdLiteral + ` ` + PurgeAPIsCmdLiteral + ` --token 2fdca1b6-6a28-4aea-add6-77c97033bdb9 --endpoint https://dev-tools.wso2.com/apim-ai-service -e production 
 						NOTE: All the flags (--token, --endpoint and --environment (-e)) are mandatory`
 
-
-// UploadCmd represents the Upload command
-var UploadCmd = &cobra.Command{
-	Use:     UploadCmdLiteral,
-	Short:   UploadCmdShortDesc,
-	Long:    UploadCmdLongDesc,
-	Example: UploadCmdExamples,
+// PurgeCmd represents the Purge command
+var PurgeCmd = &cobra.Command{
+	Use:     PurgeCmdLiteral,
+	Short:   PurgeCmdShortDesc,
+	Long:    PurgeCmdLongDesc,
+	Example: PurgeCmdExamples,
 	Run: func(cmd *cobra.Command, args []string) {
-		utils.Logln(utils.LogPrefixInfo + UploadCmdLiteral + " called")
-
+		utils.Logln(utils.LogPrefixInfo + PurgeCmdLiteral + " called")
 	},
 }
 
 // init using Cobra
 func init() {
-	RootCmd.AddCommand(UploadCmd)
+	AiCmd.AddCommand(PurgeCmd)
 }

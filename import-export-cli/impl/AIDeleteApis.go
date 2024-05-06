@@ -27,8 +27,8 @@ import (
  
 func PurgeAPIs(credential credentials.Credential, cmdUsername, authToken, endpointUrl string) {
  
-	 onPremKey = authToken
-	 endpoint = endpointUrl
+	 OnPremKey = authToken
+	 Endpoint = endpointUrl
   
 	 fmt.Println("Removing existing APIs from vector DB..!")
 	 err := RemoveExistingAPIs()
