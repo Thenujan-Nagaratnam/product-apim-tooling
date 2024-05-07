@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -135,10 +136,10 @@ func ProcessAPIs(accessToken, tenant, endpointPath string, apiListQueue chan<- [
 		count, apis = getAPIList(Credential, CmdUploadEnvironment, tenant)
 		UploadAPIsAI(tenant, apiListQueue)
 		apiListOffset = 0
-		count, apiProducts, _ = GetAPIProductListFromEnv(accessToken, CmdUploadEnvironment, "", fmt.Sprint(utils.MaxAPIsToExportOnce))
+		count, apiProducts, _ = GetAPIProductListFromEnv(accessToken, CmdUploadEnvironment, "", strconv.Itoa(utils.MaxAPIsToExportOnce)+"&offset="+strconv.Itoa(apiListOffset))
 		UploadAPIProductsAI(tenant, apiListQueue)
 	} else if UploadProducts {
-		count, apiProducts, _ = GetAPIProductListFromEnv(accessToken, CmdUploadEnvironment, "", fmt.Sprint(utils.MaxAPIsToExportOnce))
+		count, apiProducts, _ = GetAPIProductListFromEnv(accessToken, CmdUploadEnvironment, "", strconv.Itoa(utils.MaxAPIsToExportOnce)+"&offset="+strconv.Itoa(apiListOffset))
 		UploadAPIProductsAI(tenant, apiListQueue)
 	} else {
 		count, apis = getAPIList(Credential, CmdUploadEnvironment, tenant)
@@ -230,7 +231,6 @@ func UploadAPIsAI(tenant string, apiListQueue chan<- []map[string]interface{}) {
 		}
 		fmt.Println("\nTotal number of APIs processed: " + cast.ToString(counterSuceededAPIs))
 	}
-
 }
 
 func getAPIPayload(apiOrProduct interface{}, accessToken, cmdUploadEnvironment, tenant string, uploadProducts bool) map[string]interface{} {
@@ -299,8 +299,6 @@ func ReadZipFile(file *zip.File, apiPayload map[string]interface{}, tenant, name
 		}
 
 		data, _ := jsonResp["data"].(map[string]interface{})
-
-		fmt.Println("visibility", data["visibility"].(string))
 
 		if data["visibility"] != "PUBLIC" {
 			fmt.Println("visibility", data["visibility"].(string))

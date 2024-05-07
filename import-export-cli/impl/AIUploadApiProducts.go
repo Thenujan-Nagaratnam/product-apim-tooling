@@ -54,7 +54,7 @@ func UploadAPIProductsAI(tenant string, apiListQueue chan<- []map[string]interfa
 				fmt.Println("Error getting OAuth Tokens : " + preCommandErr.Error())
 			}
 			apiListOffset += utils.MaxAPIsToExportOnce
-			count, apiProducts, _ = GetAPIProductListFromEnv(accessToken, CmdUploadEnvironment, "", "?limit="+strconv.Itoa(utils.MaxAPIsToExportOnce)+"&offset="+strconv.Itoa(apiListOffset))
+			count, apiProducts, _ = GetAPIProductListFromEnv(accessToken, CmdUploadEnvironment, "", strconv.Itoa(utils.MaxAPIsToExportOnce)+"&offset="+strconv.Itoa(apiListOffset))
 			startingApiIndexFromList = 0
 		}
 		fmt.Println("\nTotal number of APIs processed: " + cast.ToString(counterSuceededAPIs))
