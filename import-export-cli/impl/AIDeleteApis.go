@@ -19,20 +19,60 @@
 package impl
 
 import (
+	"encoding/json"
 	"fmt"
 
+	"github.com/go-resty/resty/v2"
 	"github.com/wso2/product-apim-tooling/import-export-cli/credentials"
 	"github.com/wso2/product-apim-tooling/import-export-cli/utils"
 )
- 
+
+func RemoveAPIs() error {
+	headers := make(map[string]string)
+	headers["API-KEY"] = OnPremKey
+
+	var resp *resty.Response
+	var deleteErr error
+
+	for attempt := 1; attempt <= 2; attempt++ {
+		resp, deleteErr = utils.InvokeDELETERequest(Endpoint+"/ai/spec-populator/bulk-remove", headers)
+		if deleteErr != nil {
+			fmt.Printf("Error removing existing APIs (attempt %d): %v\n", attempt, deleteErr)
+			continue
+		}
+
+		if resp.StatusCode() != 200 {
+			fmt.Printf("Removing existing APIs failed with status %d %s (attempt %d)\n", resp.StatusCode(), resp.Body(), attempt)
+			continue
+		}
+
+		jsonResp := map[string]map[string]int32{}
+
+		err := json.Unmarshal(resp.Body(), &jsonResp)
+
+		if err != nil {
+			utils.HandleErrorAndContinue("Error in unmarshalling response:", err)
+			continue
+		}
+
+		fmt.Printf("Removed %d APIs successfully from vector database (attempt %d)\n", jsonResp["message"]["delete_count"], attempt)
+		return nil
+	}
+
+	if deleteErr != nil {
+		return fmt.Errorf("Error removing existing APIs after retry: %v", deleteErr)
+	}
+	return fmt.Errorf("Removing existing APIs failed after retry")
+}
+
 func PurgeAPIs(credential credentials.Credential, cmdUsername, authToken, endpointUrl string) {
- 
-	 OnPremKey = authToken
-	 Endpoint = endpointUrl
-  
-	 fmt.Println("Removing existing APIs from vector DB..!")
-	 err := RemoveExistingAPIs()
-	 if err != nil {
-		 utils.HandleErrorAndExit("Error in removing existing APIs", err)
-	 }
+
+	OnPremKey = authToken
+	Endpoint = endpointUrl
+
+	fmt.Println("Removing existing APIs from vector DB..!")
+	err := RemoveAPIs()
+	if err != nil {
+		utils.HandleErrorAndExit("Error in removing existing APIs", err)
+	}
 }

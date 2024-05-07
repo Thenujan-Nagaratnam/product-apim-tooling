@@ -23,6 +23,7 @@ import (
 	"strconv"
 	"sync/atomic"
 
+	"github.com/spf13/cast"
 	"github.com/wso2/product-apim-tooling/import-export-cli/credentials"
 	"github.com/wso2/product-apim-tooling/import-export-cli/utils"
 )
@@ -44,8 +45,8 @@ func UploadAPIProductsAI(tenant string, apiListQueue chan<- []map[string]interfa
 					apiPayload := getAPIPayload(apiProducts[i], accessToken, CmdUploadEnvironment, tenant, true)
 					if apiPayload != nil {
 						apiList = append(apiList, apiPayload)
-						counterSuceededAPIs++
 					}
+					counterSuceededAPIs++
 				}
 				atomic.AddInt32(&totalAPIs, int32(len(apiList)))
 				apiListQueue <- apiList
@@ -56,5 +57,6 @@ func UploadAPIProductsAI(tenant string, apiListQueue chan<- []map[string]interfa
 			count, apiProducts, _ = GetAPIProductListFromEnv(accessToken, CmdUploadEnvironment, "", "?limit="+strconv.Itoa(utils.MaxAPIsToExportOnce)+"&offset="+strconv.Itoa(apiListOffset))
 			startingApiIndexFromList = 0
 		}
+		fmt.Println("\nTotal number of APIs processed: " + cast.ToString(counterSuceededAPIs))
 	}
 }

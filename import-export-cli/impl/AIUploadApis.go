@@ -30,6 +30,7 @@ import (
 	"sync/atomic"
 
 	"github.com/go-resty/resty/v2"
+	"github.com/spf13/cast"
 	"github.com/wso2/product-apim-tooling/import-export-cli/credentials"
 	"github.com/wso2/product-apim-tooling/import-export-cli/utils"
 )
@@ -43,44 +44,6 @@ var CmdUploadEnvironment = ""
 var UploadProducts = false
 var UploadAll = false
 
-func RemoveExistingAPIs() error {
-	headers := make(map[string]string)
-	headers["API-KEY"] = OnPremKey
-
-	var resp *resty.Response
-	var deleteErr error
-
-	for attempt := 1; attempt <= 2; attempt++ {
-		resp, deleteErr = utils.InvokeDELETERequest(Endpoint+"/ai/spec-populator/bulk-remove", headers)
-		if deleteErr != nil {
-			fmt.Printf("Error removing existing APIs (attempt %d): %v\n", attempt, deleteErr)
-			continue
-		}
-
-		if resp.StatusCode() != 200 {
-			fmt.Printf("Removing existing APIs failed with status %d %s (attempt %d)\n", resp.StatusCode(), resp.Body(), attempt)
-			continue
-		}
-
-		jsonResp := map[string]map[string]int32{}
-
-		err := json.Unmarshal(resp.Body(), &jsonResp)
-
-		if err != nil {
-			utils.HandleErrorAndContinue("Error in unmarshalling response:", err)
-			continue
-		}
-
-		fmt.Printf("Removed %d APIs successfully from vector database (attempt %d)\n", jsonResp["message"]["delete_count"], attempt)
-		return nil
-	}
-
-	if deleteErr != nil {
-		return fmt.Errorf("Error removing existing APIs after retry: %v", deleteErr)
-	}
-	return fmt.Errorf("Removing existing APIs failed after retry")
-}
-
 func UploadAPIs(credential credentials.Credential, cmdUploadEnvironment, authToken, endpointUrl string, uploadAll, uploadProducts bool) {
 
 	OnPremKey = authToken
@@ -89,6 +52,8 @@ func UploadAPIs(credential credentials.Credential, cmdUploadEnvironment, authTok
 	Credential = credential
 	UploadAll = uploadAll
 	UploadProducts = uploadProducts
+
+	RemoveAPIs()
 
 	publisherEndpoint := utils.GetPublisherEndpointOfEnv(cmdUploadEnvironment, utils.MainConfigFilePath)
 
@@ -251,8 +216,8 @@ func UploadAPIsAI(tenant string, apiListQueue chan<- []map[string]interface{}) {
 					apiPayload := getAPIPayload(apis[i], accessToken, CmdUploadEnvironment, tenant, false)
 					if apiPayload != nil {
 						apiList = append(apiList, apiPayload)
-						counterSuceededAPIs++
 					}
+					counterSuceededAPIs++
 				}
 				atomic.AddInt32(&totalAPIs, int32(len(apiList)))
 				apiListQueue <- apiList
@@ -263,7 +228,9 @@ func UploadAPIsAI(tenant string, apiListQueue chan<- []map[string]interface{}) {
 			count, apis = getAPIList(Credential, CmdUploadEnvironment, tenant)
 			startingApiIndexFromList = 0
 		}
+		fmt.Println("\nTotal number of APIs processed: " + cast.ToString(counterSuceededAPIs))
 	}
+
 }
 
 func getAPIPayload(apiOrProduct interface{}, accessToken, cmdUploadEnvironment, tenant string, uploadProducts bool) map[string]interface{} {
@@ -301,6 +268,9 @@ func getAPIPayload(apiOrProduct interface{}, accessToken, cmdUploadEnvironment, 
 
 		for _, file := range zipReader.File {
 			apiPayload = ReadZipFile(file, apiPayload, tenant, name)
+			if apiPayload == nil {
+				return nil
+			}
 		}
 		return apiPayload
 	} else {
@@ -330,7 +300,10 @@ func ReadZipFile(file *zip.File, apiPayload map[string]interface{}, tenant, name
 
 		data, _ := jsonResp["data"].(map[string]interface{})
 
+		fmt.Println("visibility", data["visibility"].(string))
+
 		if data["visibility"] != "PUBLIC" {
+			fmt.Println("visibility", data["visibility"].(string))
 			return nil
 		}
 
