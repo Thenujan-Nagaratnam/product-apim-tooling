@@ -20,7 +20,7 @@ package impl
 
 import (
 	"fmt"
-	"sync"
+	"strconv"
 	"sync/atomic"
 
 	"github.com/wso2/product-apim-tooling/import-export-cli/credentials"
@@ -29,43 +29,42 @@ import (
 
 var apiProducts []utils.APIProduct
 
-func UploadAPIProducts(credential credentials.Credential, cmdUploadEnvironment, authToken, endpointUrl, CmdUsername string, exportAPIPreserveStatus, runningExportApiCommand, exportAPIsAllRevisions bool) {
+// func UploadAPIProducts(credential credentials.Credential, cmdUploadEnvironment, authToken, endpointUrl string, uploadAll bool) {
 
-	OnPremKey = authToken
-	Endpoint = endpointUrl
-	CmdUploadEnvironment = cmdUploadEnvironment
-	Credential = credential
-	ExportAPIPreserveStatus = exportAPIPreserveStatus
-	RunningExportApiCommand = runningExportApiCommand
-	ExportAllRevisions = exportAPIsAllRevisions
-	PublisherEndpoint = utils.GetPublisherEndpointOfEnv(cmdUploadEnvironment, utils.MainConfigFilePath)
+// 	OnPremKey = authToken
+// 	Endpoint = endpointUrl
+// 	CmdUploadEnvironment = cmdUploadEnvironment
+// 	Credential = credential
+// 	publisherEndpoint := utils.GetPublisherEndpointOfEnv(cmdUploadEnvironment, utils.MainConfigFilePath)
+// 	UploadAll = uploadAll
+// 	UploadProducts = true
 
-	fmt.Println("Uploading public APIs to vector DB...")
+// 	fmt.Println("Uploading public APIs to vector DB...")
 
-	accessToken, preCommandErr := credentials.GetOAuthAccessToken(credential, cmdUploadEnvironment)
+// 	accessToken, preCommandErr := credentials.GetOAuthAccessToken(credential, cmdUploadEnvironment)
 
-	if preCommandErr != nil {
-		utils.HandleErrorAndExit("Error getting access token", preCommandErr)
-	}
+// 	if preCommandErr != nil {
+// 		utils.HandleErrorAndExit("Error getting access token", preCommandErr)
+// 	}
 
-	apiListQueue := make(chan []map[string]interface{}, 10)
+// 	apiListQueue := make(chan []map[string]interface{}, 10)
 
-	go ProduceAPIPayloads(accessToken, apiListQueue)
+// 	go ProduceAPIPayloads(accessToken, publisherEndpoint, apiListQueue)
 
-	numConsumers := 3
-	var wg sync.WaitGroup
-	for i := 0; i < numConsumers; i++ {
-		wg.Add(1)
-		go ConsumeAPIPayloads(apiListQueue, &wg)
-	}
+// 	numConsumers := 3
+// 	var wg sync.WaitGroup
+// 	for i := 0; i < numConsumers; i++ {
+// 		wg.Add(1)
+// 		go ConsumeAPIPayloads(apiListQueue, &wg)
+// 	}
 
-	wg.Wait()
+// 	wg.Wait()
 
-	fmt.Printf("\nTotal number of public APIs present in the API Manager: %d\nTotal number of APIs successfully uploaded: %d\n\n", totalAPIs, uploadedAPIs)
-}
+// 	fmt.Printf("\nTotal number of public APIs present in the API Manager: %d\nTotal number of APIs successfully uploaded: %d\n\n", totalAPIs, uploadedAPIs)
+// }
 
 // Do the API exportation
-func ExportAPIProductsAI(cmdResourceTenantDomain string, apiListQueue chan<- []map[string]interface{}) {
+func ExportAPIProductsAI(tenant string, apiListQueue chan<- []map[string]interface{}) {
 	if count == 0 {
 		fmt.Println("No APIs available to be exported..!")
 	} else {
@@ -76,7 +75,7 @@ func ExportAPIProductsAI(cmdResourceTenantDomain string, apiListQueue chan<- []m
 			if preCommandErr == nil {
 				apiList := []map[string]interface{}{}
 				for i := startingApiIndexFromList; i < len(apiProducts); i++ {
-					apiPayload := exportAPIandReturn(apiProducts[i], accessToken, CmdUploadEnvironment, true)
+					apiPayload := getAPIPayload(apiProducts[i], accessToken, CmdUploadEnvironment, tenant, true)
 					if apiPayload != nil {
 						apiList = append(apiList, apiPayload)
 						counterSuceededAPIs++
@@ -88,7 +87,7 @@ func ExportAPIProductsAI(cmdResourceTenantDomain string, apiListQueue chan<- []m
 				fmt.Println("Error getting OAuth Tokens : " + preCommandErr.Error())
 			}
 			apiListOffset += utils.MaxAPIsToExportOnce
-			count, apiProducts, _ = GetAPIProductListFromEnv(accessToken, CmdUploadEnvironment, "", fmt.Sprint(utils.MaxAPIsToExportOnce))
+			count, apiProducts, _ = GetAPIProductListFromEnv(accessToken, CmdUploadEnvironment, "", "?limit="+strconv.Itoa(utils.MaxAPIsToExportOnce)+"&offset="+strconv.Itoa(apiListOffset))
 			startingApiIndexFromList = 0
 		}
 	}

@@ -19,8 +19,6 @@
 package cmd
 
 import (
-	"path/filepath"
-
 	"github.com/spf13/cobra"
 	"github.com/wso2/product-apim-tooling/import-export-cli/credentials"
 	"github.com/wso2/product-apim-tooling/import-export-cli/impl"
@@ -43,27 +41,29 @@ var UploadAPIProductsCmd = &cobra.Command{
 	Example: uploadAPIProductsCmdExamples,
 	Run: func(cmd *cobra.Command, args []string) {
 		utils.Logln(utils.LogPrefixInfo + UploadAPIsCmdLiteral + " called")
-		var artifactExportDirectory = filepath.Join(utils.ExportDirectory, utils.ExportedMigrationArtifactsDirName)
 
 		cred, err := GetCredentials(CmdUploadEnvironment)
 		if err != nil {
 			utils.HandleErrorAndExit("Error getting credentials", err)
 		}
-		executeUploadAPIProductsCmd(cred, token, endpoint, artifactExportDirectory)
+		executeUploadAPIProductsCmd(cred, token, endpoint)
 	},
 }
 
 // Do operations to upload APIs to the vector database
-func executeUploadAPIProductsCmd(credential credentials.Credential, token, endpoint, exportDirectory string) {
-	impl.UploadAPIProducts(credential, CmdUploadEnvironment, token, endpoint, CmdUsername, exportAPIPreserveStatus, runningExportApiCommand, exportAPIsAllRevisions)
+func executeUploadAPIProductsCmd(credential credentials.Credential, token, endpoint string) {
+	impl.UploadAPIs(credential, CmdUploadEnvironment, token, endpoint, uploadAll, true)
 }
 
 func init() {
-	UploadCmd.AddCommand(UploadAPIsCmd)
-	UploadAPIsCmd.Flags().StringVarP(&CmdUploadEnvironment, "environment", "e",
+	UploadCmd.AddCommand(UploadAPIProductsCmd)
+	UploadAPIProductsCmd.Flags().StringVarP(&CmdUploadEnvironment, "environment", "e",
 		"", "Environment from which the APIs should be uploaded")
-	UploadAPIsCmd.Flags().StringVarP(&token, "token", "", "", "on-prem-key of the organization")
-	UploadAPIsCmd.Flags().StringVarP(&endpoint, "endpoint", "", "", "endpoint of the marketplace assistant service")
-	_ = UploadAPIsCmd.MarkFlagRequired("environment")
-	_ = UploadAPIsCmd.MarkFlagRequired("token")
+	UploadAPIProductsCmd.Flags().StringVarP(&token, "token", "", "", "on-prem-key of the organization")
+	UploadAPIProductsCmd.Flags().StringVarP(&endpoint, "endpoint", "", "", "endpoint of the marketplace assistant service")
+	UploadAPIProductsCmd.Flags().BoolVarP(&uploadAll, "all", "", false,
+		"Upload both apis and api products")
+	_ = UploadAPIProductsCmd.MarkFlagRequired("environment")
+	_ = UploadAPIProductsCmd.MarkFlagRequired("token")
+
 }

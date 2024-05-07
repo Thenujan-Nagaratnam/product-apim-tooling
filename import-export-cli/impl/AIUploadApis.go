@@ -38,15 +38,10 @@ var OnPremKey string
 var uploadedAPIs int32
 var totalAPIs int32
 var Endpoint = utils.DefaultAIEndpoint
-var PublisherEndpoint string
 var Credential credentials.Credential
-var ExportAPIPreserveStatus = false
-var RunningExportApiCommand = false
-var CmdUsername = ""
-var ExportAllRevisions = false
 var CmdUploadEnvironment = ""
-var uploadProducts = false
-var uploadAll = false
+var UploadProducts = false
+var UploadAll = false
 
 func RemoveExistingAPIs() error {
 	headers := make(map[string]string)
@@ -86,16 +81,16 @@ func RemoveExistingAPIs() error {
 	return fmt.Errorf("Removing existing APIs failed after retry")
 }
 
-func UploadAPIs(credential credentials.Credential, cmdUploadEnvironment, authToken, endpointUrl, CmdUsername string, exportAPIPreserveStatus, runningExportApiCommand, exportAPIsAllRevisions bool) {
+func UploadAPIs(credential credentials.Credential, cmdUploadEnvironment, authToken, endpointUrl string, uploadAll, uploadProducts bool) {
 
 	OnPremKey = authToken
 	Endpoint = endpointUrl
 	CmdUploadEnvironment = cmdUploadEnvironment
 	Credential = credential
-	ExportAPIPreserveStatus = exportAPIPreserveStatus
-	RunningExportApiCommand = runningExportApiCommand
-	ExportAllRevisions = exportAPIsAllRevisions
-	PublisherEndpoint = utils.GetPublisherEndpointOfEnv(cmdUploadEnvironment, utils.MainConfigFilePath)
+	UploadAll = uploadAll
+	UploadProducts = uploadProducts
+
+	publisherEndpoint := utils.GetPublisherEndpointOfEnv(cmdUploadEnvironment, utils.MainConfigFilePath)
 
 	fmt.Println("Uploading public APIs to vector DB...")
 
@@ -107,9 +102,9 @@ func UploadAPIs(credential credentials.Credential, cmdUploadEnvironment, authTok
 
 	apiListQueue := make(chan []map[string]interface{}, 10)
 
-	go ProduceAPIPayloads(accessToken, apiListQueue)
+	go ProduceAPIPayloads(accessToken, publisherEndpoint, apiListQueue)
 
-	numConsumers := 3
+	numConsumers := utils.MarketplaceAssistantThreadSize
 	var wg sync.WaitGroup
 	for i := 0; i < numConsumers; i++ {
 		wg.Add(1)
@@ -121,16 +116,16 @@ func UploadAPIs(credential credentials.Credential, cmdUploadEnvironment, authTok
 	fmt.Printf("\nTotal number of public APIs present in the API Manager: %d\nTotal number of APIs successfully uploaded: %d\n\n", totalAPIs, uploadedAPIs)
 }
 
-func ProduceAPIPayloads(accessToken string, apiListQueue chan<- []map[string]interface{}) {
-	ProcessTenants(accessToken, "tenants?state=active&limit=100&offset=0", apiListQueue)
+func ProduceAPIPayloads(accessToken, publisherEndpoint string, apiListQueue chan<- []map[string]interface{}) {
+	publisherEndpoint = utils.AppendSlashToString(publisherEndpoint)
+	ProcessTenants(accessToken, publisherEndpoint, "tenants?state=active&limit=100&offset=0", apiListQueue)
 	close(apiListQueue)
 }
 
 // process all the tenants
-func ProcessTenants(accessToken, endpointPath string, apiListQueue chan<- []map[string]interface{}) {
-	PublisherEndpoint = utils.AppendSlashToString(PublisherEndpoint)
+func ProcessTenants(accessToken, publisherEndpoint, endpointPath string, apiListQueue chan<- []map[string]interface{}) {
 
-	requestURL := PublisherEndpoint + endpointPath
+	requestURL := publisherEndpoint + endpointPath
 	utils.Logln(utils.LogPrefixInfo+"ExportAPI: URL:", requestURL)
 	headers := make(map[string]string)
 	headers[utils.HeaderAuthorization] = utils.HeaderValueAuthBearerPrefix + " " + accessToken
@@ -144,7 +139,7 @@ func ProcessTenants(accessToken, endpointPath string, apiListQueue chan<- []map[
 	}
 
 	tenantListResponse := &utils.TenantListResponse{}
-	fmt.Println(tenantListResponse.List)
+	// fmt.Println(tenantListResponse.List)
 	err = json.Unmarshal([]byte(resp.Body()), tenantListResponse)
 	if err != nil {
 		fmt.Println("Error unmarshalling tenant list response:", err)
@@ -166,7 +161,7 @@ func ProcessTenants(accessToken, endpointPath string, apiListQueue chan<- []map[
 
 	// Process next set of tenants
 	if tenantListResponse.Pagination.Next != "" {
-		ProcessTenants(accessToken, tenantListResponse.Pagination.Next, apiListQueue)
+		ProcessTenants(accessToken, publisherEndpoint, tenantListResponse.Pagination.Next, apiListQueue)
 	}
 }
 
@@ -174,10 +169,19 @@ func ProcessTenants(accessToken, endpointPath string, apiListQueue chan<- []map[
 func ProcessAPIs(accessToken, tenant, endpointPath string, apiListQueue chan<- []map[string]interface{}) {
 	apiListOffset = 0
 	startingApiIndexFromList = 0
-	if uploadProducts {
+	if UploadAll {
+		fmt.Println("Upload all")
+		count, apis = getAPIList(Credential, CmdUploadEnvironment, tenant)
+		ExportAPIsAI(tenant, apiListQueue)
+		apiListOffset = 0
+		count, apiProducts, _ = GetAPIProductListFromEnv(accessToken, CmdUploadEnvironment, "", fmt.Sprint(utils.MaxAPIsToExportOnce))
+		ExportAPIProductsAI(tenant, apiListQueue)
+	} else if UploadProducts {
+		fmt.Println("Upload products")
 		count, apiProducts, _ = GetAPIProductListFromEnv(accessToken, CmdUploadEnvironment, "", fmt.Sprint(utils.MaxAPIsToExportOnce))
 		ExportAPIProductsAI(tenant, apiListQueue)
 	} else {
+		fmt.Println("Upload apis")
 		count, apis = getAPIList(Credential, CmdUploadEnvironment, tenant)
 		ExportAPIsAI(tenant, apiListQueue)
 	}
@@ -194,7 +198,6 @@ func ConsumeAPIPayloads(apiListQueue <-chan []map[string]interface{}, wg *sync.W
 
 // InvokePOSTRequest uploads the APIs to the vector DB
 func InvokePOSTRequest(apiList []map[string]interface{}) {
-	fmt.Println("apiList", len(apiList))
 	fmt.Printf("Uploading %d APIs for tenant: %s\n", len(apiList), apiList[0]["tenant_domain"])
 	payload, err := json.Marshal(map[string]interface{}{"apis": apiList})
 	if err != nil {
@@ -240,17 +243,18 @@ func InvokePOSTRequest(apiList []map[string]interface{}) {
 }
 
 // Do the API exportation
-func ExportAPIsAI(cmdResourceTenantDomain string, apiListQueue chan<- []map[string]interface{}) {
+func ExportAPIsAI(tenant string, apiListQueue chan<- []map[string]interface{}) {
 	if count == 0 {
 		fmt.Println("No APIs available to be exported..!")
 	} else {
+		fmt.Println("Count: ", count)
 		var counterSuceededAPIs = 0
 		for count > 0 {
 			accessToken, preCommandErr := credentials.GetOAuthAccessToken(Credential, CmdUploadEnvironment)
 			if preCommandErr == nil {
 				apiList := []map[string]interface{}{}
 				for i := startingApiIndexFromList; i < len(apis); i++ {
-					apiPayload := exportAPIandReturn(apis[i], accessToken, CmdUploadEnvironment, false)
+					apiPayload := getAPIPayload(apis[i], accessToken, CmdUploadEnvironment, tenant, false)
 					if apiPayload != nil {
 						apiList = append(apiList, apiPayload)
 						counterSuceededAPIs++
@@ -262,22 +266,22 @@ func ExportAPIsAI(cmdResourceTenantDomain string, apiListQueue chan<- []map[stri
 				fmt.Println("Error getting OAuth Tokens : " + preCommandErr.Error())
 			}
 			apiListOffset += utils.MaxAPIsToExportOnce
-			count, apis = getAPIList(Credential, CmdUploadEnvironment, cmdResourceTenantDomain)
+			count, apis = getAPIList(Credential, CmdUploadEnvironment, tenant)
 			startingApiIndexFromList = 0
 		}
 	}
 }
 
-func exportAPIandReturn(apiOrProduct interface{}, accessToken, cmdExportEnvironment string, uploadProducts bool) map[string]interface{} {
+func getAPIPayload(apiOrProduct interface{}, accessToken, cmdUploadEnvironment, tenant string, uploadProducts bool) map[string]interface{} {
 	var resp *resty.Response
 	var err error
 
 	if uploadProducts {
 		var apiProduct = apiOrProduct.(utils.APIProduct)
-		resp, err = ExportAPIFromEnv(accessToken, apiProduct.Name, apiProduct.Version, "", apiProduct.Provider, "json", cmdExportEnvironment, true, true)
+		resp, err = ExportAPIProductFromEnv(accessToken, apiProduct.Name, apiProduct.Version, "", apiProduct.Provider, "json", cmdUploadEnvironment, true, true)
 	} else {
 		var api = apiOrProduct.(utils.API)
-		resp, err = ExportAPIProductFromEnv(accessToken, api.Name, api.Version, "", api.Provider, "json", cmdExportEnvironment, true, true)
+		resp, err = ExportAPIFromEnv(accessToken, api.Name, api.Version, "", api.Provider, "json", cmdUploadEnvironment, true, true)
 	}
 
 	if err != nil {
@@ -293,16 +297,17 @@ func exportAPIandReturn(apiOrProduct interface{}, accessToken, cmdExportEnvironm
 		apiPayload := map[string]interface{}{}
 
 		for _, file := range zipReader.File {
-			apiPayload = ReadZipFile(file, apiPayload)
+			apiPayload = ReadZipFile(file, apiPayload, tenant)
 		}
 		return apiPayload
 	} else {
+		// utils.HandleErrorAndContinue("Error getting zip file", err)
 		utils.PrintErrorResponseAndExit(resp)
 		return nil
 	}
 }
 
-func ReadZipFile(file *zip.File, apiPayload map[string]interface{}) map[string]interface{} {
+func ReadZipFile(file *zip.File, apiPayload map[string]interface{}, tenant string) map[string]interface{} {
 	fileReader, err := file.Open()
 	if err != nil {
 		utils.HandleErrorAndContinue("Error while opening file", err)
@@ -329,8 +334,12 @@ func ReadZipFile(file *zip.File, apiPayload map[string]interface{}) map[string]i
 		apiPayload["uuid"] = data["id"].(string)
 		apiPayload["api_name"] = data["name"].(string)
 		apiPayload["version"] = data["version"].(string)
-		apiPayload["tenant_domain"] = data["organizationId"].(string)
-		apiPayload["api_type"] = data["type"].(string)
+		apiPayload["tenant_domain"] = tenant
+		if jsonResp["type"] == "api" {
+			apiPayload["api_type"] = data["type"].(string)
+		} else {
+			apiPayload["api_type"] = "APIPRODUCT"
+		}
 
 	} else if strings.HasSuffix(file.Name, "swagger.json") {
 		var jsonResp map[string]interface{}

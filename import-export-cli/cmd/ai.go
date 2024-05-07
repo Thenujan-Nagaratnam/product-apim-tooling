@@ -27,9 +27,9 @@ import (
 const AiCmdLiteral = "ai"
 const AiCmdShortDesc = "Command for AI related operations."
 const AiCmdLongDesc = `Perform AI related operations such as uploading APIs and API Products to a vector database to provide context to the marketplace assistant.`
-const AiCmdExamples = utils.ProjectName + ` ` + AiCmdLiteral + ` ` + UploadCmdLiteral + ` --token 2fdca1b6-6a28-4aea-add6-77c97033bdb9 --endpoint https://dev-tools.wso2.com/apim-ai-service -e production 
-						NOTE: All the flags (--token, --endpoint and --environment (-e)) are mandatory`
-
+const AiCmdExamples = utils.ProjectName + ` ` + AiCmdLiteral + ` ` + UploadCmdLiteral + ` ` + UploadAPIsCmdLiteral + ` --token 2fdca1b6-6a28-4aea-add6-77c97033bdb9 --endpoint https://dev-tools.wso2.com/apim-ai-service -e production
+` + utils.ProjectName + ` ` + AiCmdLiteral + ` ` + UploadCmdLiteral + ` ` + UploadAPIProductsCmdLiteral + ` --token 2fdca1b6-6a28-4aea-add6-77c97033bdb9 --endpoint https://dev-tools.wso2.com/apim-ai-service -e production 
+NOTE: All the flags (--token, --endpoint and --environment (-e)) are mandatory`
 
 // AiCmd represents the Ai command
 var AiCmd = &cobra.Command{
