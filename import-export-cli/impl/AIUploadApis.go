@@ -45,6 +45,8 @@ var RunningExportApiCommand = false
 var CmdUsername = ""
 var ExportAllRevisions = false
 var CmdUploadEnvironment = ""
+var uploadProducts = false
+var uploadAll = false
 
 func RemoveExistingAPIs() error {
 	headers := make(map[string]string)
@@ -172,8 +174,13 @@ func ProcessTenants(accessToken, endpointPath string, apiListQueue chan<- []map[
 func ProcessAPIs(accessToken, tenant, endpointPath string, apiListQueue chan<- []map[string]interface{}) {
 	apiListOffset = 0
 	startingApiIndexFromList = 0
-	count, apis = getAPIList(Credential, CmdUploadEnvironment, tenant)
-	ExportAPIsAI(tenant, apiListQueue)
+	if uploadProducts {
+		count, apiProducts, _ = GetAPIProductListFromEnv(accessToken, CmdUploadEnvironment, "", fmt.Sprint(utils.MaxAPIsToExportOnce))
+		ExportAPIProductsAI(tenant, apiListQueue)
+	} else {
+		count, apis = getAPIList(Credential, CmdUploadEnvironment, tenant)
+		ExportAPIsAI(tenant, apiListQueue)
+	}
 }
 
 // get apiList from the queue and upload them
@@ -237,20 +244,19 @@ func ExportAPIsAI(cmdResourceTenantDomain string, apiListQueue chan<- []map[stri
 	if count == 0 {
 		fmt.Println("No APIs available to be exported..!")
 	} else {
-
 		var counterSuceededAPIs = 0
 		for count > 0 {
-			atomic.AddInt32(&totalAPIs, count)
 			accessToken, preCommandErr := credentials.GetOAuthAccessToken(Credential, CmdUploadEnvironment)
 			if preCommandErr == nil {
 				apiList := []map[string]interface{}{}
 				for i := startingApiIndexFromList; i < len(apis); i++ {
-					apiPayload := exportAPIandReturn(apis[i], accessToken, CmdUploadEnvironment, ExportAPIPreserveStatus)
+					apiPayload := exportAPIandReturn(apis[i], accessToken, CmdUploadEnvironment, false)
 					if apiPayload != nil {
 						apiList = append(apiList, apiPayload)
+						counterSuceededAPIs++
 					}
-					counterSuceededAPIs++
 				}
+				atomic.AddInt32(&totalAPIs, int32(counterSuceededAPIs))
 				apiListQueue <- apiList
 			} else {
 				fmt.Println("Error getting OAuth Tokens : " + preCommandErr.Error())
@@ -262,17 +268,23 @@ func ExportAPIsAI(cmdResourceTenantDomain string, apiListQueue chan<- []map[stri
 	}
 }
 
-// Export the API and archive to zip format
-func exportAPIandReturn(api utils.API, accessToken, cmdExportEnvironment string, exportAPIPreserveStatus bool) map[string]interface{} {
+func exportAPIandReturn(apiOrProduct interface{}, accessToken, cmdExportEnvironment string, uploadProducts bool) map[string]interface{} {
+	var resp *resty.Response
+	var err error
 
-	resp, err := ExportAPIFromEnv(accessToken, api.Name, api.Version, "",
-		api.Provider, "json", cmdExportEnvironment, exportAPIPreserveStatus, true)
+	if uploadProducts {
+		var apiProduct = apiOrProduct.(utils.APIProduct)
+		resp, err = ExportAPIFromEnv(accessToken, apiProduct.Name, apiProduct.Version, "", apiProduct.Provider, "json", cmdExportEnvironment, true, true)
+	} else {
+		var api = apiOrProduct.(utils.API)
+		resp, err = ExportAPIProductFromEnv(accessToken, api.Name, api.Version, "", api.Provider, "json", cmdExportEnvironment, true, true)
+	}
+
 	if err != nil {
 		utils.HandleErrorAndContinue("Error getting zip file", err)
 	}
 
 	if resp.StatusCode() == http.StatusOK {
-
 		zipReader, err := zip.NewReader(bytes.NewReader(resp.Body()), int64(len(resp.Body())))
 		if err != nil {
 			utils.HandleErrorAndContinue("Error reading zip file", err)
@@ -285,7 +297,6 @@ func exportAPIandReturn(api utils.API, accessToken, cmdExportEnvironment string,
 		}
 		return apiPayload
 	} else {
-		fmt.Println("Error exporting API:", api.Name, "-", api.Version, " of Provider:", api.Provider)
 		utils.PrintErrorResponseAndExit(resp)
 		return nil
 	}
@@ -303,7 +314,7 @@ func ReadZipFile(file *zip.File, apiPayload map[string]interface{}) map[string]i
 		utils.HandleErrorAndContinue("Error while reading file", err)
 	}
 
-	if strings.HasSuffix(file.Name, "api.json") {
+	if strings.HasSuffix(file.Name, "api.json") || strings.HasSuffix(file.Name, "product.json") {
 		var jsonResp map[string]interface{}
 		if err := json.Unmarshal(fileContents, &jsonResp); err != nil {
 			utils.HandleErrorAndContinue("Error unmarshalling YAML content: %v\n", err)

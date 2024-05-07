@@ -27,22 +27,20 @@ import (
 	"github.com/wso2/product-apim-tooling/import-export-cli/utils"
 )
 
-const UploadAPIsCmdLiteral = "apis"
-const uploadAPIsCmdShortDesc = "Upload APIs and API Products to a vector database."
+const UploadAPIProductsCmdLiteral = "api-products"
+const uploadAPIProductsCmdShortDesc = "Upload APIs and API Products to a vector database."
 
-const uploadAPIsCmdLongDesc = "Upload public APIs and API Products in an environment to a vector database to provide context to the marketplace assistant."
-const uploadAPIsCmdExamples = utils.ProjectName + ` ` + UploadCmdLiteral + ` ` + UploadAPIsCmdLiteral + ` --token 2fdca1b6-6a28-4aea-add6-77c97033bdb9 --endpoint https://dev-tools.wso2.com/apim-ai-service -e production 
-							NOTE: All the flags (--token, --endpoint and --environment (-e)) are mandatory`
+// const uploadAPIProductsCmdLongDesc = "Upload public APIs and API Products in an environment to a vector database to provide context to the marketplace assistant."
+const uploadAPIProductsCmdLongDesc = `Upload public APIs and API Products available in the environment specified by flag (--environment, -e)`
+const uploadAPIProductsCmdExamples = utils.ProjectName + ` ` + UploadCmdLiteral + ` ` + UploadAPIProductsCmdLiteral + ` --token 2fdca1b6-6a28-4aea-add6-77c97033bdb9 --endpoint https://dev-tools.wso2.com/apim-ai-service -e production 
+							 NOTE: All the flags (--token, --endpoint and --environment (-e)) are mandatory`
 
-var token string
-var endpoint string
-
-var UploadAPIsCmd = &cobra.Command{
-	Use: UploadAPIsCmdLiteral + " (--endpoint <endpoint-url> --token <on-prem-key-of-the-organization> --environment " +
+var UploadAPIProductsCmd = &cobra.Command{
+	Use: UploadAPIProductsCmdLiteral + " (--endpoint <endpoint-url> --token <on-prem-key-of-the-organization> --environment " +
 		"<environment-from-which-artifacts-should-be-uploaded>)",
-	Short:   uploadAPIsCmdShortDesc,
-	Long:    uploadAPIsCmdLongDesc,
-	Example: uploadAPIsCmdExamples,
+	Short:   uploadAPIProductsCmdShortDesc,
+	Long:    uploadAPIProductsCmdLongDesc,
+	Example: uploadAPIProductsCmdExamples,
 	Run: func(cmd *cobra.Command, args []string) {
 		utils.Logln(utils.LogPrefixInfo + UploadAPIsCmdLiteral + " called")
 		var artifactExportDirectory = filepath.Join(utils.ExportDirectory, utils.ExportedMigrationArtifactsDirName)
@@ -51,13 +49,13 @@ var UploadAPIsCmd = &cobra.Command{
 		if err != nil {
 			utils.HandleErrorAndExit("Error getting credentials", err)
 		}
-		executeUploadAPIsCmd(cred, token, endpoint, artifactExportDirectory)
+		executeUploadAPIProductsCmd(cred, token, endpoint, artifactExportDirectory)
 	},
 }
 
 // Do operations to upload APIs to the vector database
-func executeUploadAPIsCmd(credential credentials.Credential, token, endpoint, exportDirectory string) {
-	impl.UploadAPIs(credential, CmdUploadEnvironment, token, endpoint, CmdUsername, exportAPIPreserveStatus, runningExportApiCommand, exportAPIsAllRevisions)
+func executeUploadAPIProductsCmd(credential credentials.Credential, token, endpoint, exportDirectory string) {
+	impl.UploadAPIProducts(credential, CmdUploadEnvironment, token, endpoint, CmdUsername, exportAPIPreserveStatus, runningExportApiCommand, exportAPIsAllRevisions)
 }
 
 func init() {
