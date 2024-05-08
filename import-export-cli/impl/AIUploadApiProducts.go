@@ -31,7 +31,7 @@ import (
 var apiProducts []utils.APIProduct
 
 // Do the API exportation
-func UploadAPIProductsAI(tenant string, apiListQueue chan<- []map[string]interface{}) {
+func UploadAPIProductsAI(apiListQueue chan<- []map[string]interface{}) {
 	fmt.Println("Uploading API Products..!")
 	if count == 0 {
 		fmt.Println("No APIs available to be exported..!")
@@ -42,7 +42,7 @@ func UploadAPIProductsAI(tenant string, apiListQueue chan<- []map[string]interfa
 			if preCommandErr == nil {
 				apiList := []map[string]interface{}{}
 				for i := startingApiIndexFromList; i < len(apiProducts); i++ {
-					apiPayload := getAPIPayload(apiProducts[i], accessToken, CmdUploadEnvironment, tenant, true)
+					apiPayload := getAPIPayload(apiProducts[i], accessToken, CmdUploadEnvironment, true)
 					if apiPayload != nil {
 						apiList = append(apiList, apiPayload)
 					}
