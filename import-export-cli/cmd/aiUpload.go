@@ -20,21 +20,16 @@ package cmd
 
 import (
 	"github.com/spf13/cobra"
-	"github.com/wso2/product-apim-tooling/import-export-cli/credentials"
-	"github.com/wso2/product-apim-tooling/import-export-cli/impl"
 	"github.com/wso2/product-apim-tooling/import-export-cli/utils"
 )
 
 // Upload command related usage Info
-const UploadCmdLiteral = "vector-db-upload" // ai upload apis, ai upload api-products
+const UploadCmdLiteral = "upload"
 const UploadCmdShortDesc = "Upload APIs and API Products in an environment to a vector database to provide context to the marketplace assistant."
 const UploadCmdLongDesc = `Upload APIs and API Products available in the environment specified by flag (--environment, -e)`
-const UploadCmdExamples = utils.ProjectName + ` ` + UploadCmdLiteral  + ` --token 2fdca1b6-6a28-4aea-add6-77c97033bdb9 --endpoint https://dev-tools.wso2.com/apim-ai-service -e production 
+const UploadCmdExamples = utils.ProjectName + ` ` + AiCmdLiteral + ` ` + UploadCmdLiteral + ` ` + UploadAPIsCmdLiteral + ` --token 2fdca1b6-6a28-4aea-add6-77c97033bdb9 --endpoint https://dev-tools.wso2.com/apim-ai-service -e production 
 						NOTE: All the flags (--token, --endpoint and --environment (-e)) are mandatory`
 
-
-var token string
-var endpoint string
 
 // UploadCmd represents the Upload command
 var UploadCmd = &cobra.Command{
@@ -45,27 +40,10 @@ var UploadCmd = &cobra.Command{
 	Run: func(cmd *cobra.Command, args []string) {
 		utils.Logln(utils.LogPrefixInfo + UploadCmdLiteral + " called")
 
-		cred, err := GetCredentials(CmdUploadEnvironment)
-		if err != nil {
-			utils.HandleErrorAndExit("Error getting credentials", err)
-		}
-		executeUploadCmd(cred, token, endpoint)
 	},
-}
-
-// Do operations to upload APIs to the vector database
-func executeUploadCmd(credential credentials.Credential, token, endpoint string) {
-	impl.UploadAPIs(credential, CmdUploadEnvironment, token, endpoint)
 }
 
 // init using Cobra
 func init() {
-	RootCmd.AddCommand(UploadCmd)
-	UploadCmd.Flags().StringVarP(&CmdUploadEnvironment, "environment", "e",
-		"", "Environment from which the APIs should be uploaded")
-	UploadCmd.Flags().StringVarP(&token, "token", "", "", "on-prem-key of the organization")
-	UploadCmd.Flags().StringVarP(&endpoint, "endpoint", "", "", "endpoint of the marketplace assistant service")
-	_ = UploadCmd.MarkFlagRequired("environment")
-	_ = UploadCmd.MarkFlagRequired("token")
-	_ = UploadCmd.MarkFlagRequired("endpoint")
+	AiCmd.AddCommand(UploadCmd)
 }

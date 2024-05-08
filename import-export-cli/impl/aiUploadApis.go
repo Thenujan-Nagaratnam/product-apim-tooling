@@ -33,6 +33,9 @@ var onPremKey string
 var uploadedAPIs int32
 var totalAPIs int32
 var endpoint string
+var UploadProducts bool
+var UploadAll bool
+var Accesstoken string
 
 func RemoveExistingAPIs() error {
 	headers := make(map[string]string)
@@ -72,10 +75,12 @@ func RemoveExistingAPIs() error {
 	return fmt.Errorf("Removing existing APIs failed after retry")
 }
 
-func UploadAPIs(credential credentials.Credential, cmdUploadEnvironment, token, endpointUrl string) {
+func UploadAPIs(credential credentials.Credential, accessToken, cmdUploadEnvironment, token, endpointUrl string, uploadAll, uploadProducts bool) {
 
 	onPremKey = token
 	endpoint = endpointUrl
+	UploadProducts = uploadProducts
+	UploadAll = uploadAll
 
 	devPortalEndpoint := utils.GetDevPortalEndpointOfEnv(cmdUploadEnvironment, utils.MainConfigFilePath)
 
@@ -90,8 +95,15 @@ func UploadAPIs(credential credentials.Credential, cmdUploadEnvironment, token, 
 	// buffered channel with 10 slots
 	apiListQueue := make(chan []map[string]interface{}, 10)
 
+	// // get access token
+	// accesstoken, err := credentials.GetOAuthAccessToken(credential, cmdUploadEnvironment)
+
+	// if err != nil {
+	// 	utils.HandleErrorAndExit("Error getting access token", err)
+	// }
+
 	// producer
-	go ProduceAPIPayloads(devPortalEndpoint, apiListQueue)
+	go ProduceAPIPayloads(accessToken, devPortalEndpoint, apiListQueue)
 
 	// consumer
 	numConsumers := utils.MarketplaceAssistantThreadCount
@@ -106,26 +118,26 @@ func UploadAPIs(credential credentials.Credential, cmdUploadEnvironment, token, 
 	fmt.Printf("\nTotal number of public APIs present in the API Manager: %d\nTotal number of APIs successfully uploaded: %d\n\n", totalAPIs, uploadedAPIs)
 }
 
-func InvokeGETRequest(requestURL, tenant string) (*resty.Response, error) {
+func InvokeGETRequest(requestURL, accesstoken, tenant string) (*resty.Response, error) {
 	utils.Logln(utils.LogPrefixInfo+"ExportAPI: URL:", requestURL)
 	headers := make(map[string]string)
-	headers["x-wso2-tenant"] = tenant
+	headers["X-WSO2-Tenant"] = tenant
+	// headers[utils.HeaderAuthorization] = utils.HeaderValueAuthBearerPrefix + " " + accesstoken  // uncomment this if you want to include all the private apis as well
 	headers[utils.HeaderAccept] = utils.JsonArrayFormatType
 
 	return utils.InvokeGETRequest(requestURL, headers)
 }
 
-func ProduceAPIPayloads(devPortalEndpoint string, apiListQueue chan<- []map[string]interface{}) {
-	ProcessTenants(devPortalEndpoint, "tenants?state=active&limit=100&offset=0", apiListQueue)
+func ProduceAPIPayloads(accesstoken, devPortalEndpoint string, apiListQueue chan<- []map[string]interface{}) {
+	ProcessTenants(accesstoken, devPortalEndpoint, "/tenants?state=active&limit=100&offset=0", apiListQueue)
 	close(apiListQueue)
 }
 
 // process all the tenants
-func ProcessTenants(devPortalEndpoint, endpointPath string, apiListQueue chan<- []map[string]interface{}) {
-	devPortalEndpoint = utils.AppendSlashToString(devPortalEndpoint)
+func ProcessTenants(accesstoken, devPortalEndpoint, endpointPath string, apiListQueue chan<- []map[string]interface{}) {
 
 	requestURL := devPortalEndpoint + endpointPath
-	resp, err := InvokeGETRequest(requestURL, "")
+	resp, err := InvokeGETRequest(requestURL, accesstoken, "")
 	if err != nil {
 		fmt.Println("Error in getting tenants:", err)
 		return
@@ -142,26 +154,26 @@ func ProcessTenants(devPortalEndpoint, endpointPath string, apiListQueue chan<- 
 	if tenantCount == 0 {
 		// Handle carbon.super tenant
 		fmt.Println("Processing tenant:", utils.DefaultTenantDomain)
-		ProcessAPIs(devPortalEndpoint, utils.DefaultTenantDomain, "apis?limit=10&offset=0", apiListQueue)
+		ProcessAPIs(accesstoken, devPortalEndpoint, utils.DefaultTenantDomain, "/apis?limit=10&offset=0", apiListQueue)
 	} else {
 		// Handle all tenants
 		for _, tenant := range tenantListResponse.List {
 			fmt.Println("Processing tenant:", tenant.Domain)
-			ProcessAPIs(devPortalEndpoint, tenant.Domain, "apis?limit=10&offset=0", apiListQueue)
+			ProcessAPIs(accesstoken, devPortalEndpoint, tenant.Domain, "/apis?limit=10&offset=0", apiListQueue)
 		}
 	}
 
 	// Process next set of tenants
 	if tenantListResponse.Pagination.Next != "" {
-		ProcessTenants(devPortalEndpoint, tenantListResponse.Pagination.Next, apiListQueue)
+		ProcessTenants(accesstoken, devPortalEndpoint, tenantListResponse.Pagination.Next, apiListQueue)
 	}
 }
 
 // process apis in a tenant
-func ProcessAPIs(devPortalEndpoint, tenant, endpointPath string, apiListQueue chan<- []map[string]interface{}) {
+func ProcessAPIs(accesstoken, devPortalEndpoint, tenant, endpointPath string, apiListQueue chan<- []map[string]interface{}) {
 	requestURL := devPortalEndpoint + endpointPath
 
-	resp, err := InvokeGETRequest(requestURL, tenant)
+	resp, err := InvokeGETRequest(requestURL, accesstoken, tenant)
 	if err != nil {
 		utils.HandleErrorAndContinue("Error in getting APIs for tenant: "+tenant, err)
 	}
@@ -178,6 +190,15 @@ func ProcessAPIs(devPortalEndpoint, tenant, endpointPath string, apiListQueue ch
 	apiList := []map[string]interface{}{}
 
 	for _, api := range apiListResponse.List {
+
+		if !UploadAll {
+			if api.Type == "APIPRODUCT" && !UploadProducts {
+				continue
+			} else if api.Type != "APIPRODUCT" && UploadProducts {
+				continue
+			}
+		}
+
 		apiPayload := map[string]interface{}{
 			"uuid":          api.ID,
 			"description":   api.Description,
@@ -189,8 +210,8 @@ func ProcessAPIs(devPortalEndpoint, tenant, endpointPath string, apiListQueue ch
 
 		switch api.Type {
 		case "HTTP", "APIPRODUCT", "REST", "SOAP", "SOAPTOREST":
-			requestURL := devPortalEndpoint + "apis/" + api.ID + "/swagger"
-			swaggerResp, err := InvokeGETRequest(requestURL, tenant)
+			requestURL := devPortalEndpoint + "/apis/" + api.ID + "/swagger"
+			swaggerResp, err := InvokeGETRequest(requestURL, accesstoken, tenant)
 			if err == nil {
 				apiPayload["api_spec"] = swaggerResp.String()
 			} else {
@@ -198,8 +219,8 @@ func ProcessAPIs(devPortalEndpoint, tenant, endpointPath string, apiListQueue ch
 			}
 
 		case "GRAPHQL":
-			requestURL := devPortalEndpoint + "apis/" + api.ID + "/graphql-schema"
-			schemaResp, err := InvokeGETRequest(requestURL, tenant)
+			requestURL := devPortalEndpoint + "/apis/" + api.ID + "/graphql-schema"
+			schemaResp, err := InvokeGETRequest(requestURL, accesstoken, tenant)
 			if err == nil {
 				apiPayload["sdl_schema"] = schemaResp.String()
 			} else {
@@ -207,8 +228,8 @@ func ProcessAPIs(devPortalEndpoint, tenant, endpointPath string, apiListQueue ch
 			}
 
 		case "WS", "WEBSUB", "ASYNC", "SSE", "WEBHOOK":
-			requestURL := devPortalEndpoint + "apis/" + api.ID + "/async-api-specification"
-			asyncResp, err := InvokeGETRequest(requestURL, tenant)
+			requestURL := devPortalEndpoint + "/apis/" + api.ID + "/async-api-specification"
+			asyncResp, err := InvokeGETRequest(requestURL, accesstoken, tenant)
 			if err == nil {
 				apiPayload["async_spec"] = asyncResp.String()
 			} else {
@@ -218,11 +239,12 @@ func ProcessAPIs(devPortalEndpoint, tenant, endpointPath string, apiListQueue ch
 		apiList = append(apiList, apiPayload)
 
 	}
-	apiListQueue <- apiList
-
+	if len(apiList) > 0 {
+		apiListQueue <- apiList
+	}
 	// Process next set of APIs
 	if apiListResponse.Pagination.Next != "" {
-		ProcessAPIs(devPortalEndpoint, tenant, apiListResponse.Pagination.Next, apiListQueue)
+		ProcessAPIs(accesstoken, devPortalEndpoint, tenant, apiListResponse.Pagination.Next, apiListQueue)
 	}
 }
 
