@@ -49,7 +49,9 @@ func UploadAPIProductsAI(tenant string, apiListQueue chan<- []map[string]interfa
 					counterSuceededAPIs++
 				}
 				atomic.AddInt32(&totalAPIs, int32(len(apiList)))
-				apiListQueue <- apiList
+				if len(apiList) > 0 {
+					apiListQueue <- apiList
+				}
 			} else {
 				fmt.Println("Error getting OAuth Tokens : " + preCommandErr.Error())
 			}

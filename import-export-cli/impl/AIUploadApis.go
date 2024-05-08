@@ -130,6 +130,7 @@ func ProcessTenants(accessToken, publisherEndpoint, endpointPath string, apiList
 
 // process apis in a tenant
 func ProcessAPIs(accessToken, tenant, endpointPath string, apiListQueue chan<- []map[string]interface{}) {
+	fmt.Println("Processing APIs for tenant:", tenant)
 	apiListOffset = 0
 	startingApiIndexFromList = 0
 	if UploadAll {
@@ -221,7 +222,9 @@ func UploadAPIsAI(tenant string, apiListQueue chan<- []map[string]interface{}) {
 					counterSuceededAPIs++
 				}
 				atomic.AddInt32(&totalAPIs, int32(len(apiList)))
-				apiListQueue <- apiList
+				if len(apiList) > 0 {
+					apiListQueue <- apiList
+				}
 			} else {
 				fmt.Println("Error getting OAuth Tokens : " + preCommandErr.Error())
 			}
@@ -243,14 +246,14 @@ func getAPIPayload(apiOrProduct interface{}, accessToken, cmdUploadEnvironment, 
 		if api.LifeCycleStatus != "PUBLISHED" && api.LifeCycleStatus != "PROTOTYPED" {
 			return nil
 		}
-		resp, err = ExportAPIProductFromEnv(accessToken, api.Name, api.Version, "", api.Provider, "json", cmdUploadEnvironment, true, true)
+		resp, err = ExportAPIProductFromEnv(accessToken, api.Name, api.Version, "", api.Provider, "json", cmdUploadEnvironment, false, true)
 		name = api.Name + "-" + api.Version
 	} else {
 		var api = apiOrProduct.(utils.API)
 		if api.LifeCycleStatus != "PUBLISHED" && api.LifeCycleStatus != "PROTOTYPED" {
 			return nil
 		}
-		resp, err = ExportAPIFromEnv(accessToken, api.Name, api.Version, "", api.Provider, "json", cmdUploadEnvironment, true, true)
+		resp, err = ExportAPIFromEnv(accessToken, api.Name, api.Version, "", api.Provider, "json", cmdUploadEnvironment, true, false)
 		name = api.Name + "-" + api.Version
 	}
 
@@ -301,7 +304,6 @@ func ReadZipFile(file *zip.File, apiPayload map[string]interface{}, tenant, name
 		data, _ := jsonResp["data"].(map[string]interface{})
 
 		if data["visibility"] != "PUBLIC" {
-			fmt.Println("visibility", data["visibility"].(string))
 			return nil
 		}
 
