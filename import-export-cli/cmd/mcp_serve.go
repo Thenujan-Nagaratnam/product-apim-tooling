@@ -21,6 +21,7 @@ package cmd
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -28,6 +29,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
@@ -36,6 +38,14 @@ import (
 const mcpServeCmdLiteral = "serve"
 const mcpServeCmdShortDesc = "Start MCP server over stdio"
 const mcpServeCmdLongDesc = "Start a long-running Model Context Protocol (MCP) server over stdio for AI agents"
+
+// Security/resource limits
+// Max size of a single JSON-RPC line read from stdin. Increase if your payloads are larger.
+const maxRequestBytes = 4 * 1024 * 1024 // 4 MiB
+
+// Subprocess execution constraints
+const maxExecDuration = 60 * time.Second
+const maxOutputBytes = 4 * 1024 * 1024 // cap stdout/stderr per call
 
 type jsonRPCRequest struct {
 	JSONRPC string          `json:"jsonrpc"`
@@ -73,6 +83,8 @@ func init() {
 
 func runMCPServer(stdin io.Reader, stdout io.Writer, stderr io.Writer) {
 	scanner := bufio.NewScanner(stdin)
+	// Cap the maximum line size to prevent unbounded memory usage
+	scanner.Buffer(make([]byte, 64*1024), maxRequestBytes)
 	for scanner.Scan() {
 		line := scanner.Bytes()
 		var req jsonRPCRequest
@@ -248,7 +260,6 @@ func buildArgvFromCobraNormalized(name string, args map[string]any) ([]string, b
 	} else {
 		argv = append(argv, full...)
 	}
-	used := 0
 	cmd.Flags().VisitAll(func(f *pflag.Flag) {
 		if f.Hidden {
 			return
@@ -257,18 +268,15 @@ func buildArgvFromCobraNormalized(name string, args map[string]any) ([]string, b
 		camel := kebabToCamel(long)
 		if v, ok := args[long]; ok {
 			appendFlagArg(&argv, f, v)
-			used++
 			return
 		}
 		if v, ok := args[camel]; ok {
 			appendFlagArg(&argv, f, v)
-			used++
 			return
 		}
 		if f.Shorthand != "" {
 			if v, ok := args[f.Shorthand]; ok {
 				appendFlagArg(&argv, f, v)
-				used++
 				return
 			}
 		}
@@ -425,8 +433,50 @@ func extractArgv(p toolsCallParams) ([]string, error) {
 }
 
 func splitShellLike(s string) []string {
-	// simple splitter on spaces; does not handle quotes/escapes
-	return strings.Fields(s)
+	// Minimal shell-like splitting supporting double/single quotes and escapes
+	var parts []string
+	var cur strings.Builder
+	inSingle := false
+	inDouble := false
+	escaped := false
+	for _, r := range s {
+		if escaped {
+			cur.WriteRune(r)
+			escaped = false
+			continue
+		}
+		switch r {
+		case '\\':
+			escaped = true
+		case '\'':
+			if !inDouble {
+				inSingle = !inSingle
+				continue
+			}
+			cur.WriteRune(r)
+		case '"':
+			if !inSingle {
+				inDouble = !inDouble
+				continue
+			}
+			cur.WriteRune(r)
+		case ' ', '\t', '\n':
+			if inSingle || inDouble {
+				cur.WriteRune(r)
+				continue
+			}
+			if cur.Len() > 0 {
+				parts = append(parts, cur.String())
+				cur.Reset()
+			}
+		default:
+			cur.WriteRune(r)
+		}
+	}
+	if cur.Len() > 0 {
+		parts = append(parts, cur.String())
+	}
+	return parts
 }
 
 type apictlExecResult struct {
@@ -442,18 +492,48 @@ func execApictl(argv []string) apictlExecResult {
 	}
 	// resolve symlink if any
 	exe, _ = filepath.EvalSymlinks(exe)
-	cmd := exec.Command(exe, argv...)
+
+	ctx, cancel := context.WithTimeout(context.Background(), maxExecDuration)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, exe, argv...)
+
 	var outBuf, errBuf bytes.Buffer
 	cmd.Stdout = &outBuf
 	cmd.Stderr = &errBuf
-	err = cmd.Run()
+
+	runErr := cmd.Start()
+	if runErr != nil {
+		return apictlExecResult{Stdout: "", Stderr: runErr.Error(), ExitCode: 1}
+	}
+	waitErr := cmd.Wait()
+
 	exitCode := 0
-	if err != nil {
-		if ee, ok := err.(*exec.ExitError); ok && ee.ProcessState != nil {
+	if waitErr != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			_ = cmd.Process.Kill()
+			return apictlExecResult{Stdout: safeTruncate(outBuf.String(), maxOutputBytes), Stderr: "execution timed out", ExitCode: 124}
+		}
+		if ee, ok := waitErr.(*exec.ExitError); ok && ee.ProcessState != nil {
 			exitCode = ee.ProcessState.ExitCode()
 		} else {
 			exitCode = 1
 		}
 	}
-	return apictlExecResult{Stdout: outBuf.String(), Stderr: errBuf.String(), ExitCode: exitCode}
+
+	return apictlExecResult{
+		Stdout:   safeTruncate(outBuf.String(), maxOutputBytes),
+		Stderr:   safeTruncate(errBuf.String(), maxOutputBytes),
+		ExitCode: exitCode,
+	}
+}
+
+func safeTruncate(s string, max int) string {
+	if max <= 0 {
+		return ""
+	}
+	if len(s) <= max {
+		return s
+	}
+	return s[:max]
 }
