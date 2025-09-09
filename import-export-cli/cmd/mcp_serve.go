@@ -27,9 +27,13 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
@@ -47,6 +51,9 @@ const maxRequestBytes = 4 * 1024 * 1024 // 4 MiB
 const maxExecDuration = 60 * time.Second
 const maxOutputBytes = 4 * 1024 * 1024 // cap stdout/stderr per call
 
+// MCP Protocol timeouts and limits
+const defaultRequestTimeout = 30 * time.Second
+
 // Tool exposure configuration
 var toolMode string      // "all" | "minimal"
 var toolInclude []string // optional root-level allowlist
@@ -58,10 +65,13 @@ var minimalExcluded = map[string]struct{}{
 
 type jsonRPCRequest struct {
 	JSONRPC string          `json:"jsonrpc"`
-	ID      int             `json:"id,omitempty"`
+	ID      interface{}     `json:"id,omitempty"`
 	Method  string          `json:"method"`
 	Params  json.RawMessage `json:"params,omitempty"`
 }
+
+// jsonRPCBatch represents either a single request or an array of requests
+type jsonRPCBatch []jsonRPCRequest
 
 type jsonRPCResponse struct {
 	JSONRPC string        `json:"jsonrpc"`
@@ -102,6 +112,8 @@ type initializeResult struct {
 
 // Server state
 var isInitialized = false
+var shutdownChan = make(chan bool, 1)
+var pendingRequests = sync.Map{} // track pending requests for timeout/cancellation
 
 // Serve MCP over stdio
 var mcpServeCmd = &cobra.Command{
@@ -122,34 +134,127 @@ func init() {
 }
 
 func runMCPServer(stdin io.Reader, stdout io.Writer, stderr io.Writer) {
+	// Setup signal handling for graceful shutdown
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	// Channel for scanner to communicate completion
+	scanDone := make(chan error, 1)
+
 	scanner := bufio.NewScanner(stdin)
 	// Cap the maximum line size to prevent unbounded memory usage
 	scanner.Buffer(make([]byte, 64*1024), maxRequestBytes)
-	for scanner.Scan() {
-		line := scanner.Bytes()
-		var req jsonRPCRequest
-		if err := json.Unmarshal(line, &req); err != nil {
-			writeJSON(stdout, jsonRPCResponse{JSONRPC: "2.0", Error: &jsonRPCError{Code: -32600, Message: "Invalid request", Data: err.Error()}})
-			continue
+
+	// Run scanner in goroutine
+	go func() {
+		defer close(scanDone)
+		for scanner.Scan() {
+			line := scanner.Bytes()
+
+			// Validate UTF-8 encoding as required by MCP spec
+			if !utf8.Valid(line) {
+				logToStderr(stderr, "Received non-UTF-8 encoded message")
+				writeJSON(stdout, jsonRPCResponse{
+					JSONRPC: "2.0",
+					Error:   &jsonRPCError{Code: -32600, Message: "Invalid request", Data: "Message must be UTF-8 encoded"},
+				})
+				continue
+			}
+
+			// Check for embedded newlines (forbidden by MCP spec)
+			if bytes.Contains(line, []byte("\n")) || bytes.Contains(line, []byte("\r")) {
+				logToStderr(stderr, "Received message with embedded newlines")
+				writeJSON(stdout, jsonRPCResponse{
+					JSONRPC: "2.0",
+					Error:   &jsonRPCError{Code: -32600, Message: "Invalid request", Data: "Messages must not contain embedded newlines"},
+				})
+				continue
+			}
+
+			// Try to parse as a batch first, then as a single request
+			if bytes.HasPrefix(bytes.TrimSpace(line), []byte("[")) {
+				// Handle JSON-RPC batch
+				var batch jsonRPCBatch
+				if err := json.Unmarshal(line, &batch); err != nil {
+					logToStderr(stderr, fmt.Sprintf("Failed to parse JSON-RPC batch: %v", err))
+					writeJSON(stdout, jsonRPCResponse{JSONRPC: "2.0", Error: &jsonRPCError{Code: -32600, Message: "Invalid request", Data: err.Error()}})
+					continue
+				}
+				handleBatch(batch, stdout, stderr)
+			} else {
+				// Handle single JSON-RPC request
+				var req jsonRPCRequest
+				if err := json.Unmarshal(line, &req); err != nil {
+					logToStderr(stderr, fmt.Sprintf("Failed to parse JSON-RPC request: %v", err))
+					writeJSON(stdout, jsonRPCResponse{JSONRPC: "2.0", Error: &jsonRPCError{Code: -32600, Message: "Invalid request", Data: err.Error()}})
+					continue
+				}
+				handleSingleRequest(req, stdout, stderr)
+			}
 		}
-		resp := dispatchMCP(req)
-		writeJSON(stdout, resp)
+		if err := scanner.Err(); err != nil {
+			scanDone <- err
+		}
+	}()
+
+	// Wait for shutdown signal or scanner completion
+	select {
+	case sig := <-sigChan:
+		logToStderr(stderr, fmt.Sprintf("Received signal %v, shutting down gracefully...", sig))
+		handleShutdown(stdout, stderr)
+	case err := <-scanDone:
+		if err != nil {
+			logToStderr(stderr, fmt.Sprintf("Scanner error: %v", err))
+		}
+		logToStderr(stderr, "Input stream closed, shutting down...")
+	case <-shutdownChan:
+		logToStderr(stderr, "Server shutdown requested...")
 	}
-	if err := scanner.Err(); err != nil {
-		fmt.Fprintln(stderr, "scanner error:", err)
-	}
+
+	// Wait a bit for any pending operations to complete
+	time.Sleep(100 * time.Millisecond)
 }
 
 func writeJSON(w io.Writer, v any) {
-	bytes, err := json.Marshal(v)
+	data, err := json.Marshal(v)
 	if err != nil {
 		// last resort write an internal error
 		_fallback := jsonRPCResponse{JSONRPC: "2.0", Error: &jsonRPCError{Code: -32603, Message: "Internal error", Data: err.Error()}}
 		b, _ := json.Marshal(_fallback)
-		fmt.Fprintln(w, string(b))
+		writeValidatedJSON(w, b)
 		return
 	}
-	fmt.Fprintln(w, string(bytes))
+	writeValidatedJSON(w, data)
+}
+
+// writeValidatedJSON ensures JSON messages conform to MCP stdio transport requirements
+func writeValidatedJSON(w io.Writer, data []byte) {
+	// Ensure the message is valid UTF-8
+	if !utf8.Valid(data) {
+		// This should never happen with json.Marshal, but let's be safe
+		logToStderr(os.Stderr, "Attempted to write non-UTF-8 JSON")
+		return
+	}
+
+	// Ensure no embedded newlines (json.Marshal shouldn't produce these, but validate anyway)
+	if bytes.Contains(data, []byte("\n")) || bytes.Contains(data, []byte("\r")) {
+		// Replace any embedded newlines with spaces (shouldn't happen with json.Marshal)
+		data = bytes.ReplaceAll(data, []byte("\n"), []byte(" "))
+		data = bytes.ReplaceAll(data, []byte("\r"), []byte(" "))
+		logToStderr(os.Stderr, "Warning: Removed embedded newlines from JSON output")
+	}
+
+	// Write the message followed by a newline (as required by MCP stdio transport)
+	fmt.Fprintln(w, string(data))
+}
+
+// logToStderr writes UTF-8 logging messages to stderr (allowed by MCP spec)
+func logToStderr(stderr io.Writer, message string) {
+	// Ensure the log message is valid UTF-8
+	if !utf8.ValidString(message) {
+		message = "Invalid UTF-8 log message"
+	}
+	fmt.Fprintf(stderr, "[MCP Server] %s\n", message)
 }
 
 func dispatchMCP(req jsonRPCRequest) jsonRPCResponse {
@@ -158,20 +263,37 @@ func dispatchMCP(req jsonRPCRequest) jsonRPCResponse {
 		return handleInitialize(req)
 	case "notifications/initialized":
 		return handleInitialized(req)
+	case "notifications/cancelled":
+		return handleCancellation(req)
 	case "ping":
 		return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{}}
 	case "tools/list":
 		if !isInitialized {
-			return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &jsonRPCError{Code: -32002, Message: "Server not initialized"}}
+			return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &jsonRPCError{
+				Code:    -32002,
+				Message: "Server not initialized",
+				Data:    "Call 'initialize' method first",
+			}}
 		}
 		return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{"tools": listCommandsAsTools()}}
 	case "tools/call":
 		if !isInitialized {
-			return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &jsonRPCError{Code: -32002, Message: "Server not initialized"}}
+			return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &jsonRPCError{
+				Code:    -32002,
+				Message: "Server not initialized",
+				Data:    "Call 'initialize' method first",
+			}}
 		}
 		return handleToolsCall(req)
 	default:
-		return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &jsonRPCError{Code: -32601, Message: "Method not found", Data: req.Method}}
+		return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &jsonRPCError{
+			Code:    -32601,
+			Message: "Method not found",
+			Data: map[string]interface{}{
+				"method":    req.Method,
+				"available": []string{"initialize", "notifications/initialized", "notifications/cancelled", "ping", "tools/list", "tools/call"},
+			},
+		}}
 	}
 }
 
@@ -219,8 +341,27 @@ func handleInitialize(req jsonRPCRequest) jsonRPCResponse {
 
 func handleInitialized(req jsonRPCRequest) jsonRPCResponse {
 	isInitialized = true
-	// notifications don't require a response, but we return an empty one for consistency
-	return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{}}
+	// Notifications don't require a response according to JSON-RPC spec
+	return jsonRPCResponse{} // Empty response (won't be written)
+}
+
+func handleCancellation(req jsonRPCRequest) jsonRPCResponse {
+	// Parse cancellation notification
+	var params struct {
+		ID interface{} `json:"id"`
+	}
+
+	if len(req.Params) > 0 {
+		if err := json.Unmarshal(req.Params, &params); err == nil {
+			// Try to cancel the pending request
+			if _, exists := pendingRequests.LoadAndDelete(params.ID); exists {
+				logToStderr(os.Stderr, fmt.Sprintf("Cancelled request %v", params.ID))
+			}
+		}
+	}
+
+	// Notifications don't require a response
+	return jsonRPCResponse{}
 }
 
 func negotiateProtocolVersion(clientVersion string, supportedVersions []string) string {
@@ -237,6 +378,155 @@ func negotiateProtocolVersion(clientVersion string, supportedVersions []string) 
 	}
 
 	return ""
+}
+
+func handleBatch(batch jsonRPCBatch, stdout io.Writer, stderr io.Writer) {
+	if len(batch) == 0 {
+		logToStderr(stderr, "Received empty batch")
+		writeJSON(stdout, jsonRPCResponse{
+			JSONRPC: "2.0",
+			Error:   &jsonRPCError{Code: -32600, Message: "Invalid request", Data: "Batch cannot be empty"},
+		})
+		return
+	}
+
+	logToStderr(stderr, fmt.Sprintf("Processing batch of %d requests", len(batch)))
+
+	// Process each request in the batch
+	responses := make([]jsonRPCResponse, 0, len(batch))
+
+	for _, req := range batch {
+		// Validate each request in the batch
+		if req.JSONRPC != "2.0" {
+			responses = append(responses, jsonRPCResponse{
+				JSONRPC: "2.0",
+				ID:      req.ID,
+				Error:   &jsonRPCError{Code: -32600, Message: "Invalid request", Data: "JSON-RPC version must be '2.0'"},
+			})
+			continue
+		}
+
+		if req.Method == "" {
+			responses = append(responses, jsonRPCResponse{
+				JSONRPC: "2.0",
+				ID:      req.ID,
+				Error:   &jsonRPCError{Code: -32600, Message: "Invalid request", Data: "Method is required"},
+			})
+			continue
+		}
+
+		// Handle each request
+		if req.ID != nil {
+			// Request with ID - needs response
+			resp := dispatchMCP(req)
+			if resp.JSONRPC != "" {
+				responses = append(responses, resp)
+			}
+		} else {
+			// Notification - no response needed
+			dispatchMCP(req)
+		}
+	}
+
+	// Write batch response if there are any responses
+	if len(responses) > 0 {
+		if len(responses) == 1 {
+			// Single response - don't wrap in array
+			writeJSON(stdout, responses[0])
+		} else {
+			// Multiple responses - send as array
+			writeJSON(stdout, responses)
+		}
+	}
+}
+
+func handleSingleRequest(req jsonRPCRequest, stdout io.Writer, stderr io.Writer) {
+	// Validate JSON-RPC format
+	if req.JSONRPC != "2.0" {
+		writeJSON(stdout, jsonRPCResponse{
+			JSONRPC: "2.0",
+			ID:      req.ID,
+			Error:   &jsonRPCError{Code: -32600, Message: "Invalid request", Data: "JSON-RPC version must be '2.0'"},
+		})
+		return
+	}
+
+	if req.Method == "" {
+		writeJSON(stdout, jsonRPCResponse{
+			JSONRPC: "2.0",
+			ID:      req.ID,
+			Error:   &jsonRPCError{Code: -32600, Message: "Invalid request", Data: "Method is required"},
+		})
+		return
+	}
+
+	// Handle request with timeout if it has an ID
+	if req.ID != nil {
+		go handleRequestWithTimeout(req, stdout, stderr)
+	} else {
+		// Notifications don't need timeout handling
+		resp := dispatchMCP(req)
+		if resp.JSONRPC != "" { // Only write response if there is one
+			writeJSON(stdout, resp)
+		}
+	}
+}
+
+func handleRequestWithTimeout(req jsonRPCRequest, stdout io.Writer, stderr io.Writer) {
+	// Store request in pending map
+	pendingRequests.Store(req.ID, req)
+	defer pendingRequests.Delete(req.ID)
+
+	// Create timeout context
+	ctx, cancel := context.WithTimeout(context.Background(), defaultRequestTimeout)
+	defer cancel()
+
+	// Channel to receive the response
+	respChan := make(chan jsonRPCResponse, 1)
+
+	// Process request in goroutine
+	go func() {
+		resp := dispatchMCP(req)
+		respChan <- resp
+	}()
+
+	// Wait for response or timeout
+	select {
+	case resp := <-respChan:
+		writeJSON(stdout, resp)
+	case <-ctx.Done():
+		// Timeout occurred
+		timeoutResp := jsonRPCResponse{
+			JSONRPC: "2.0",
+			ID:      req.ID,
+			Error: &jsonRPCError{
+				Code:    -32000, // Server error
+				Message: "Request timeout",
+				Data:    fmt.Sprintf("Request timed out after %v", defaultRequestTimeout),
+			},
+		}
+		writeJSON(stdout, timeoutResp)
+		logToStderr(stderr, fmt.Sprintf("Request %v timed out after %v", req.ID, defaultRequestTimeout))
+	}
+}
+
+func handleShutdown(stdout io.Writer, stderr io.Writer) {
+	// Cancel any pending requests
+	pendingRequests.Range(func(key, value interface{}) bool {
+		cancelResp := jsonRPCResponse{
+			JSONRPC: "2.0",
+			ID:      key,
+			Error: &jsonRPCError{
+				Code:    -32800, // Request cancelled
+				Message: "Request cancelled due to server shutdown",
+			},
+		}
+		writeJSON(stdout, cancelResp)
+		pendingRequests.Delete(key)
+		return true
+	})
+
+	logToStderr(stderr, "Shutdown complete")
 }
 
 func sanitizeToolName(s string) string {
