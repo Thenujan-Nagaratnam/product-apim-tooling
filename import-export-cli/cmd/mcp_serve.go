@@ -52,13 +52,13 @@ var toolMode string      // "all" | "minimal"
 var toolInclude []string // optional root-level allowlist
 var toolExclude []string // optional root-level denylist
 var minimalExcluded = map[string]struct{}{
-	"ai": {}, "bundle": {}, "gen": {}, "mcp": {}, "mi": {}, "mg": {},
-	"secret": {}, "k8s": {}, "aws": {}, "vcs": {}, "completion": {},
+	"ai": {}, "bundle": {}, "gen": {}, "install": {}, "list": {}, "mcp": {}, "mi": {}, "mg": {},
+	"secret": {}, "k8s": {}, "aws": {}, "vcs": {}, "completion": {}, "uninstall": {},
 }
 
 type jsonRPCRequest struct {
 	JSONRPC string          `json:"jsonrpc"`
-	ID      interface{}     `json:"id,omitempty"`
+	ID      int             `json:"id,omitempty"`
 	Method  string          `json:"method"`
 	Params  json.RawMessage `json:"params,omitempty"`
 }
@@ -134,7 +134,7 @@ func dispatchMCP(req jsonRPCRequest) jsonRPCResponse {
 			"serverInfo":      map[string]any{"name": "apictl", "version": "dev"},
 		}}
 	case "ping":
-		return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]string{"status": "ok"}}
+		return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{}}
 	case "tools/list":
 		return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{"tools": listCommandsAsTools()}}
 	case "tools/call":
