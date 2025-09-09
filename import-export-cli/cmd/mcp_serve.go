@@ -47,6 +47,15 @@ const maxRequestBytes = 4 * 1024 * 1024 // 4 MiB
 const maxExecDuration = 60 * time.Second
 const maxOutputBytes = 4 * 1024 * 1024 // cap stdout/stderr per call
 
+// Tool exposure configuration
+var toolMode string      // "all" | "minimal"
+var toolInclude []string // optional root-level allowlist
+var toolExclude []string // optional root-level denylist
+var minimalExcluded = map[string]struct{}{
+	"ai": {}, "bundle": {}, "gen": {}, "mcp": {}, "mi": {}, "mg": {},
+	"secret": {}, "k8s": {}, "aws": {}, "vcs": {}, "completion": {},
+}
+
 type jsonRPCRequest struct {
 	JSONRPC string          `json:"jsonrpc"`
 	ID      interface{}     `json:"id,omitempty"`
@@ -79,6 +88,10 @@ var mcpServeCmd = &cobra.Command{
 
 func init() {
 	MCPCmd.AddCommand(mcpServeCmd)
+	// Flags to control exposed tools
+	mcpServeCmd.Flags().StringVar(&toolMode, "tool-mode", "all", "Tool exposure mode: all|minimal")
+	mcpServeCmd.Flags().StringSliceVar(&toolInclude, "tool-include", nil, "Comma-separated root commands to include (allowlist)")
+	mcpServeCmd.Flags().StringSliceVar(&toolExclude, "tool-exclude", nil, "Comma-separated root commands to exclude (denylist)")
 }
 
 func runMCPServer(stdin io.Reader, stdout io.Writer, stderr io.Writer) {
@@ -154,7 +167,9 @@ func listCommandsAsTools() []map[string]any {
 
 			// Only include leaf runnable commands
 			if (child.Run != nil || child.RunE != nil) && len(child.Commands()) == 0 {
-				tools = append(tools, generateToolForCommand(strings.Join(path, " "), child))
+				if shouldExposeRoot(path[0]) {
+					tools = append(tools, generateToolForCommand(strings.Join(path, " "), child))
+				}
 			}
 
 			// Keep walking to reach leaves
@@ -163,6 +178,35 @@ func listCommandsAsTools() []map[string]any {
 	}
 	walk([]string{}, RootCmd)
 	return tools
+}
+
+// shouldExposeRoot decides if a root command should be exposed as a tool
+func shouldExposeRoot(root string) bool {
+	r := strings.ToLower(strings.TrimSpace(root))
+	// If an allowlist is provided, only those are exposed
+	if len(toolInclude) > 0 {
+		for _, inc := range toolInclude {
+			if r == strings.ToLower(strings.TrimSpace(inc)) {
+				return true
+			}
+		}
+		return false
+	}
+	// Apply denylist if provided
+	if len(toolExclude) > 0 {
+		for _, exc := range toolExclude {
+			if r == strings.ToLower(strings.TrimSpace(exc)) {
+				return false
+			}
+		}
+	}
+	// Minimal mode blocks a predefined set
+	if strings.EqualFold(toolMode, "minimal") {
+		if _, blocked := minimalExcluded[r]; blocked {
+			return false
+		}
+	}
+	return true
 }
 
 func getRequiredFlags(cmd *cobra.Command) (req []string, oneOf []string) {
