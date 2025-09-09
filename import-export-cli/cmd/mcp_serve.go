@@ -76,6 +76,33 @@ type jsonRPCError struct {
 	Data    any    `json:"data,omitempty"`
 }
 
+// MCP Protocol structures
+type initializeParams struct {
+	ProtocolVersion string                 `json:"protocolVersion"`
+	Capabilities    map[string]interface{} `json:"capabilities"`
+	ClientInfo      *clientInfo            `json:"clientInfo,omitempty"`
+}
+
+type clientInfo struct {
+	Name    string `json:"name"`
+	Version string `json:"version"`
+}
+
+type serverInfo struct {
+	Name    string `json:"name"`
+	Version string `json:"version"`
+}
+
+type initializeResult struct {
+	ProtocolVersion string                 `json:"protocolVersion"`
+	Capabilities    map[string]interface{} `json:"capabilities"`
+	ServerInfo      serverInfo             `json:"serverInfo"`
+	Instructions    string                 `json:"instructions,omitempty"`
+}
+
+// Server state
+var isInitialized = false
+
 // Serve MCP over stdio
 var mcpServeCmd = &cobra.Command{
 	Use:   mcpServeCmdLiteral,
@@ -128,20 +155,88 @@ func writeJSON(w io.Writer, v any) {
 func dispatchMCP(req jsonRPCRequest) jsonRPCResponse {
 	switch req.Method {
 	case "initialize":
-		return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{
-			"protocolVersion": "2024-11-05",
-			"capabilities":    map[string]any{"tools": map[string]any{}},
-			"serverInfo":      map[string]any{"name": "apictl", "version": "dev"},
-		}}
+		return handleInitialize(req)
+	case "notifications/initialized":
+		return handleInitialized(req)
 	case "ping":
 		return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{}}
 	case "tools/list":
+		if !isInitialized {
+			return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &jsonRPCError{Code: -32002, Message: "Server not initialized"}}
+		}
 		return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{"tools": listCommandsAsTools()}}
 	case "tools/call":
+		if !isInitialized {
+			return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &jsonRPCError{Code: -32002, Message: "Server not initialized"}}
+		}
 		return handleToolsCall(req)
 	default:
 		return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &jsonRPCError{Code: -32601, Message: "Method not found", Data: req.Method}}
 	}
+}
+
+func handleInitialize(req jsonRPCRequest) jsonRPCResponse {
+	var params initializeParams
+	if len(req.Params) > 0 {
+		if err := json.Unmarshal(req.Params, &params); err != nil {
+			return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &jsonRPCError{Code: -32602, Message: "Invalid params", Data: err.Error()}}
+		}
+	}
+
+	// Supported protocol versions (newest first)
+	supportedVersions := []string{"2025-03-26", "2024-11-05"}
+	negotiatedVersion := negotiateProtocolVersion(params.ProtocolVersion, supportedVersions)
+
+	if negotiatedVersion == "" {
+		return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &jsonRPCError{
+			Code:    -32602,
+			Message: "Unsupported protocol version",
+			Data:    fmt.Sprintf("Client requested: %s, Server supports: %v", params.ProtocolVersion, supportedVersions),
+		}}
+	}
+
+	// Store negotiated version for potential future use
+
+	// Build server capabilities
+	capabilities := map[string]interface{}{
+		"tools": map[string]interface{}{
+			"listChanged": true,
+		},
+	}
+
+	result := initializeResult{
+		ProtocolVersion: negotiatedVersion,
+		Capabilities:    capabilities,
+		ServerInfo: serverInfo{
+			Name:    "apictl",
+			Version: "1.0",
+		},
+		Instructions: "This MCP server exposes WSO2 API Manager CLI (apictl) commands as tools. Ensure you're authenticated with your target environments using 'apictl login <env>' before using the tools.",
+	}
+
+	return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Result: result}
+}
+
+func handleInitialized(req jsonRPCRequest) jsonRPCResponse {
+	isInitialized = true
+	// notifications don't require a response, but we return an empty one for consistency
+	return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{}}
+}
+
+func negotiateProtocolVersion(clientVersion string, supportedVersions []string) string {
+	// First check if we support the client's requested version
+	for _, supported := range supportedVersions {
+		if clientVersion == supported {
+			return clientVersion
+		}
+	}
+
+	// If not, return our latest supported version
+	if len(supportedVersions) > 0 {
+		return supportedVersions[0]
+	}
+
+	return ""
 }
 
 func sanitizeToolName(s string) string {
