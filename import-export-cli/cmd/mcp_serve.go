@@ -113,7 +113,8 @@ type initializeResult struct {
 // Server state
 var isInitialized = false
 var shutdownChan = make(chan bool, 1)
-var pendingRequests = sync.Map{} // track pending requests for timeout/cancellation
+var pendingRequests = sync.Map{}      // track pending requests for timeout/cancellation
+var activeProgressTokens = sync.Map{} // track active progress tokens
 
 // Serve MCP over stdio
 var mcpServeCmd = &cobra.Command{
@@ -526,6 +527,15 @@ func handleShutdown(stdout io.Writer, stderr io.Writer) {
 		return true
 	})
 
+	// Clean up any active progress tokens
+	activeProgressTokens.Range(func(key, value interface{}) bool {
+		if tracker, ok := value.(*progressTracker); ok {
+			tracker.sendProgress(100, floatPtr(100), "Operation cancelled due to server shutdown")
+		}
+		activeProgressTokens.Delete(key)
+		return true
+	})
+
 	logToStderr(stderr, "Shutdown complete")
 }
 
@@ -652,6 +662,15 @@ func handleToolsCall(req jsonRPCRequest) jsonRPCResponse {
 			return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &jsonRPCError{Code: -32602, Message: "Invalid params", Data: err.Error()}}
 		}
 	}
+
+	// Set up progress tracking if a progress token is provided
+	var progressTracker *progressTracker
+	if p.Meta != nil && p.Meta.ProgressToken != nil {
+		progressTracker = newProgressTracker(p.Meta.ProgressToken, os.Stdout, os.Stderr)
+		activeProgressTokens.Store(p.Meta.ProgressToken, progressTracker)
+		defer progressTracker.cleanup()
+	}
+
 	// Map arguments dynamically from Cobra
 	if argv, ok, verr := buildArgvFromCobraNormalized(p.Name, p.Arguments); ok {
 		if verr != nil {
@@ -663,7 +682,7 @@ func handleToolsCall(req jsonRPCRequest) jsonRPCResponse {
 		if argv[0] == "mcp" {
 			return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &jsonRPCError{Code: -32602, Message: "calling mcp via MCP is not allowed"}}
 		}
-		res := execApictl(argv)
+		res := execApictlWithProgress(argv, progressTracker)
 		return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{
 			"content": []map[string]any{{"type": "text", "text": res.Stdout}},
 			"isError": res.ExitCode != 0,
@@ -680,7 +699,7 @@ func handleToolsCall(req jsonRPCRequest) jsonRPCResponse {
 	if argv[0] == "mcp" {
 		return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &jsonRPCError{Code: -32602, Message: "calling mcp via MCP is not allowed"}}
 	}
-	res := execApictl(argv)
+	res := execApictlWithProgress(argv, progressTracker)
 	return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{
 		"content": []map[string]any{{"type": "text", "text": res.Stdout}},
 		"isError": res.ExitCode != 0,
@@ -837,6 +856,70 @@ func toBool(v any) (bool, bool) {
 type toolsCallParams struct {
 	Name      string         `json:"name"`
 	Arguments map[string]any `json:"arguments"`
+	Meta      *requestMeta   `json:"_meta,omitempty"`
+}
+
+// requestMeta contains metadata for requests, including progress tokens
+type requestMeta struct {
+	ProgressToken interface{} `json:"progressToken,omitempty"`
+}
+
+type progressParams struct {
+	ProgressToken interface{} `json:"progressToken"`
+	Progress      float64     `json:"progress"`
+	Total         *float64    `json:"total,omitempty"`
+	Message       string      `json:"message,omitempty"`
+}
+
+// progressTracker helps track and send progress updates
+type progressTracker struct {
+	token     interface{}
+	stdout    io.Writer
+	stderr    io.Writer
+	lastSent  time.Time
+	rateLimit time.Duration // minimum time between progress updates
+}
+
+const defaultProgressRateLimit = 100 * time.Millisecond // max 10 updates per second
+
+// newProgressTracker creates a new progress tracker for the given token
+func newProgressTracker(token interface{}, stdout, stderr io.Writer) *progressTracker {
+	return &progressTracker{
+		token:     token,
+		stdout:    stdout,
+		stderr:    stderr,
+		rateLimit: defaultProgressRateLimit,
+	}
+}
+
+// sendProgress sends a progress notification if rate limiting allows
+func (pt *progressTracker) sendProgress(progress float64, total *float64, message string) {
+	now := time.Now()
+	if now.Sub(pt.lastSent) < pt.rateLimit {
+		return // rate limited
+	}
+
+	pt.lastSent = now
+
+	// Progress notifications are JSON-RPC notifications (no ID, no response expected)
+	notification := map[string]interface{}{
+		"jsonrpc": "2.0",
+		"method":  "notifications/progress",
+		"params": progressParams{
+			ProgressToken: pt.token,
+			Progress:      progress,
+			Total:         total,
+			Message:       message,
+		},
+	}
+
+	writeJSON(pt.stdout, notification)
+	logToStderr(pt.stderr, fmt.Sprintf("Progress update: %s - %.1f", message, progress))
+}
+
+// cleanup removes the progress token from active tracking
+func (pt *progressTracker) cleanup() {
+	activeProgressTokens.Delete(pt.token)
 }
 
 func extractArgv(p toolsCallParams) ([]string, error) {
@@ -925,6 +1008,10 @@ type apictlExecResult struct {
 }
 
 func execApictl(argv []string) apictlExecResult {
+	return execApictlWithProgress(argv, nil)
+}
+
+func execApictlWithProgress(argv []string, tracker *progressTracker) apictlExecResult {
 	exe, err := os.Executable()
 	if err != nil {
 		return apictlExecResult{Stdout: "", Stderr: err.Error(), ExitCode: 1}
@@ -941,16 +1028,41 @@ func execApictl(argv []string) apictlExecResult {
 	cmd.Stdout = &outBuf
 	cmd.Stderr = &errBuf
 
+	// Send initial progress if tracker is available
+	if tracker != nil {
+		commandName := strings.Join(argv, " ")
+		if isLongRunningCommand(argv) {
+			tracker.sendProgress(0, nil, fmt.Sprintf("Starting %s...", commandName))
+		}
+	}
+
 	runErr := cmd.Start()
 	if runErr != nil {
 		return apictlExecResult{Stdout: "", Stderr: runErr.Error(), ExitCode: 1}
 	}
+
+	// Monitor progress for long-running commands
+	var progressDone chan bool
+	if tracker != nil && isLongRunningCommand(argv) {
+		progressDone = make(chan bool)
+		go monitorProgress(tracker, argv, progressDone)
+	}
+
 	waitErr := cmd.Wait()
+
+	// Stop progress monitoring
+	if progressDone != nil {
+		progressDone <- true
+		close(progressDone)
+	}
 
 	exitCode := 0
 	if waitErr != nil {
 		if ctx.Err() == context.DeadlineExceeded {
 			_ = cmd.Process.Kill()
+			if tracker != nil {
+				tracker.sendProgress(100, floatPtr(100), "Operation timed out")
+			}
 			return apictlExecResult{Stdout: safeTruncate(outBuf.String(), maxOutputBytes), Stderr: "execution timed out", ExitCode: 124}
 		}
 		if ee, ok := waitErr.(*exec.ExitError); ok && ee.ProcessState != nil {
@@ -960,11 +1072,69 @@ func execApictl(argv []string) apictlExecResult {
 		}
 	}
 
+	// Send completion progress
+	if tracker != nil && isLongRunningCommand(argv) {
+		if exitCode == 0 {
+			tracker.sendProgress(100, floatPtr(100), "Operation completed successfully")
+		} else {
+			tracker.sendProgress(100, floatPtr(100), "Operation completed with errors")
+		}
+	}
+
 	return apictlExecResult{
 		Stdout:   safeTruncate(outBuf.String(), maxOutputBytes),
 		Stderr:   safeTruncate(errBuf.String(), maxOutputBytes),
 		ExitCode: exitCode,
 	}
+}
+
+// isLongRunningCommand determines if a command is likely to be long-running and benefit from progress tracking
+func isLongRunningCommand(argv []string) bool {
+	if len(argv) == 0 {
+		return false
+	}
+
+	longRunningCommands := map[string]bool{
+		"import": true,
+		"export": true,
+		"vcs":    true,
+		"ai":     true,
+		"bundle": true,
+		"get":    true, // some get operations can be slow
+	}
+
+	return longRunningCommands[argv[0]]
+}
+
+// monitorProgress provides periodic progress updates for long-running operations
+func monitorProgress(tracker *progressTracker, argv []string, done chan bool) {
+	commandName := strings.Join(argv, " ")
+	ticker := time.NewTicker(2 * time.Second) // Update every 2 seconds
+	defer ticker.Stop()
+
+	progress := 10.0 // Start at 10% after initial message
+	increment := 5.0 // Increase by 5% each update
+
+	for {
+		select {
+		case <-done:
+			return
+		case <-ticker.C:
+			if progress < 90 { // Don't go above 90% until completion
+				progress += increment
+				// Slow down progress as we get closer to completion
+				if progress > 50 {
+					increment = 2.0
+				}
+				tracker.sendProgress(progress, nil, fmt.Sprintf("Processing %s...", commandName))
+			}
+		}
+	}
+}
+
+// floatPtr returns a pointer to the given float64 value
+func floatPtr(f float64) *float64 {
+	return &f
 }
 
 func safeTruncate(s string, max int) string {
