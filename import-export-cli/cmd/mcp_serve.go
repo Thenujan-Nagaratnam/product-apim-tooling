@@ -115,11 +115,15 @@ func writeJSON(w io.Writer, v any) {
 func dispatchMCP(req jsonRPCRequest) jsonRPCResponse {
 	switch req.Method {
 	case "initialize":
-		return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{"capabilities": map[string]any{}}}
+		return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{
+			"protocolVersion": "2024-11-05",
+			"capabilities":    map[string]any{"tools": map[string]any{}},
+			"serverInfo":      map[string]any{"name": "apictl", "version": "dev"},
+		}}
 	case "ping":
 		return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]string{"status": "ok"}}
 	case "tools/list":
-		return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Result: listCommandsAsTools()}
+		return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{"tools": listCommandsAsTools()}}
 	case "tools/call":
 		return handleToolsCall(req)
 	default:
@@ -231,7 +235,10 @@ func handleToolsCall(req jsonRPCRequest) jsonRPCResponse {
 			return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &jsonRPCError{Code: -32602, Message: "calling mcp via MCP is not allowed"}}
 		}
 		res := execApictl(argv)
-		return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Result: res}
+		return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{
+			"content": []map[string]any{{"type": "text", "text": res.Stdout}},
+			"isError": res.ExitCode != 0,
+		}}
 	}
 	// Fallback to explicit argv
 	argv, err := extractArgv(p)
@@ -245,7 +252,10 @@ func handleToolsCall(req jsonRPCRequest) jsonRPCResponse {
 		return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &jsonRPCError{Code: -32602, Message: "calling mcp via MCP is not allowed"}}
 	}
 	res := execApictl(argv)
-	return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Result: res}
+	return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{
+		"content": []map[string]any{{"type": "text", "text": res.Stdout}},
+		"isError": res.ExitCode != 0,
+	}}
 }
 
 func buildArgvFromCobraNormalized(name string, args map[string]any) ([]string, bool, error) {
