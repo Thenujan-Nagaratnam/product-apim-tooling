@@ -110,11 +110,24 @@ type initializeResult struct {
 	Instructions    string                 `json:"instructions,omitempty"`
 }
 
+// JSON-RPC 2.0 Error Codes (from specification)
+const (
+	JSONRPCParseError           = -32700 // Invalid JSON was received by the server
+	JSONRPCInvalidRequest       = -32600 // The JSON sent is not a valid Request object
+	JSONRPCMethodNotFound       = -32601 // The method does not exist / is not available
+	JSONRPCInvalidParams        = -32602 // Invalid method parameter(s)
+	JSONRPCInternalError        = -32603 // Internal JSON-RPC error
+	JSONRPCServerError          = -32000 // Server error (generic)
+	JSONRPCRequestCancelled     = -32800 // Request cancelled
+	JSONRPCServerNotInitialized = -32002 // Server not initialized
+)
+
 // Server state
 var isInitialized = false
 var shutdownChan = make(chan bool, 1)
 var pendingRequests = sync.Map{}      // track pending requests for timeout/cancellation
 var activeProgressTokens = sync.Map{} // track active progress tokens
+var usedRequestIDs = sync.Map{}       // track used request IDs to prevent reuse
 
 // Serve MCP over stdio
 var mcpServeCmd = &cobra.Command{
@@ -157,7 +170,7 @@ func runMCPServer(stdin io.Reader, stdout io.Writer, stderr io.Writer) {
 				logToStderr(stderr, "Received non-UTF-8 encoded message")
 				writeJSON(stdout, jsonRPCResponse{
 					JSONRPC: "2.0",
-					Error:   &jsonRPCError{Code: -32600, Message: "Invalid request", Data: "Message must be UTF-8 encoded"},
+					Error:   &jsonRPCError{Code: JSONRPCInvalidRequest, Message: "Invalid request", Data: "Message must be UTF-8 encoded"},
 				})
 				continue
 			}
@@ -167,7 +180,7 @@ func runMCPServer(stdin io.Reader, stdout io.Writer, stderr io.Writer) {
 				logToStderr(stderr, "Received message with embedded newlines")
 				writeJSON(stdout, jsonRPCResponse{
 					JSONRPC: "2.0",
-					Error:   &jsonRPCError{Code: -32600, Message: "Invalid request", Data: "Messages must not contain embedded newlines"},
+					Error:   &jsonRPCError{Code: JSONRPCInvalidRequest, Message: "Invalid request", Data: "Messages must not contain embedded newlines"},
 				})
 				continue
 			}
@@ -178,7 +191,7 @@ func runMCPServer(stdin io.Reader, stdout io.Writer, stderr io.Writer) {
 				var batch jsonRPCBatch
 				if err := json.Unmarshal(line, &batch); err != nil {
 					logToStderr(stderr, fmt.Sprintf("Failed to parse JSON-RPC batch: %v", err))
-					writeJSON(stdout, jsonRPCResponse{JSONRPC: "2.0", Error: &jsonRPCError{Code: -32600, Message: "Invalid request", Data: err.Error()}})
+					writeJSON(stdout, jsonRPCResponse{JSONRPC: "2.0", Error: &jsonRPCError{Code: JSONRPCInvalidRequest, Message: "Invalid request", Data: err.Error()}})
 					continue
 				}
 				handleBatch(batch, stdout, stderr)
@@ -187,7 +200,7 @@ func runMCPServer(stdin io.Reader, stdout io.Writer, stderr io.Writer) {
 				var req jsonRPCRequest
 				if err := json.Unmarshal(line, &req); err != nil {
 					logToStderr(stderr, fmt.Sprintf("Failed to parse JSON-RPC request: %v", err))
-					writeJSON(stdout, jsonRPCResponse{JSONRPC: "2.0", Error: &jsonRPCError{Code: -32600, Message: "Invalid request", Data: err.Error()}})
+					writeJSON(stdout, jsonRPCResponse{JSONRPC: "2.0", Error: &jsonRPCError{Code: JSONRPCInvalidRequest, Message: "Invalid request", Data: err.Error()}})
 					continue
 				}
 				handleSingleRequest(req, stdout, stderr)
@@ -220,7 +233,7 @@ func writeJSON(w io.Writer, v any) {
 	data, err := json.Marshal(v)
 	if err != nil {
 		// last resort write an internal error
-		_fallback := jsonRPCResponse{JSONRPC: "2.0", Error: &jsonRPCError{Code: -32603, Message: "Internal error", Data: err.Error()}}
+		_fallback := jsonRPCResponse{JSONRPC: "2.0", Error: &jsonRPCError{Code: JSONRPCInternalError, Message: "Internal error", Data: err.Error()}}
 		b, _ := json.Marshal(_fallback)
 		writeValidatedJSON(w, b)
 		return
@@ -263,7 +276,7 @@ func dispatchMCP(req jsonRPCRequest) jsonRPCResponse {
 	case "initialize":
 		return handleInitialize(req)
 	case "notifications/initialized":
-		return handleInitialized(req)
+		return handleInitialized()
 	case "notifications/cancelled":
 		return handleCancellation(req)
 	case "ping":
@@ -271,7 +284,7 @@ func dispatchMCP(req jsonRPCRequest) jsonRPCResponse {
 	case "tools/list":
 		if !isInitialized {
 			return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &jsonRPCError{
-				Code:    -32002,
+				Code:    JSONRPCServerNotInitialized,
 				Message: "Server not initialized",
 				Data:    "Call 'initialize' method first",
 			}}
@@ -280,7 +293,7 @@ func dispatchMCP(req jsonRPCRequest) jsonRPCResponse {
 	case "tools/call":
 		if !isInitialized {
 			return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &jsonRPCError{
-				Code:    -32002,
+				Code:    JSONRPCServerNotInitialized,
 				Message: "Server not initialized",
 				Data:    "Call 'initialize' method first",
 			}}
@@ -288,7 +301,7 @@ func dispatchMCP(req jsonRPCRequest) jsonRPCResponse {
 		return handleToolsCall(req)
 	default:
 		return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &jsonRPCError{
-			Code:    -32601,
+			Code:    JSONRPCMethodNotFound,
 			Message: "Method not found",
 			Data: map[string]interface{}{
 				"method":    req.Method,
@@ -302,7 +315,7 @@ func handleInitialize(req jsonRPCRequest) jsonRPCResponse {
 	var params initializeParams
 	if len(req.Params) > 0 {
 		if err := json.Unmarshal(req.Params, &params); err != nil {
-			return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &jsonRPCError{Code: -32602, Message: "Invalid params", Data: err.Error()}}
+			return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &jsonRPCError{Code: JSONRPCInvalidParams, Message: "Invalid params", Data: err.Error()}}
 		}
 	}
 
@@ -312,7 +325,7 @@ func handleInitialize(req jsonRPCRequest) jsonRPCResponse {
 
 	if negotiatedVersion == "" {
 		return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &jsonRPCError{
-			Code:    -32602,
+			Code:    JSONRPCInvalidParams,
 			Message: "Unsupported protocol version",
 			Data:    fmt.Sprintf("Client requested: %s, Server supports: %v", params.ProtocolVersion, supportedVersions),
 		}}
@@ -320,11 +333,19 @@ func handleInitialize(req jsonRPCRequest) jsonRPCResponse {
 
 	// Store negotiated version for potential future use
 
-	// Build server capabilities
+	// Build server capabilities according to MCP specification
 	capabilities := map[string]interface{}{
 		"tools": map[string]interface{}{
 			"listChanged": true,
 		},
+		// Future: Could add prompts and resources capabilities
+		// "prompts": map[string]interface{}{
+		//     "listChanged": true,
+		// },
+		// "resources": map[string]interface{}{
+		//     "listChanged": true,
+		//     "subscribe": false,
+		// },
 	}
 
 	result := initializeResult{
@@ -340,7 +361,7 @@ func handleInitialize(req jsonRPCRequest) jsonRPCResponse {
 	return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Result: result}
 }
 
-func handleInitialized(req jsonRPCRequest) jsonRPCResponse {
+func handleInitialized() jsonRPCResponse {
 	isInitialized = true
 	// Notifications don't require a response according to JSON-RPC spec
 	return jsonRPCResponse{} // Empty response (won't be written)
@@ -386,7 +407,7 @@ func handleBatch(batch jsonRPCBatch, stdout io.Writer, stderr io.Writer) {
 		logToStderr(stderr, "Received empty batch")
 		writeJSON(stdout, jsonRPCResponse{
 			JSONRPC: "2.0",
-			Error:   &jsonRPCError{Code: -32600, Message: "Invalid request", Data: "Batch cannot be empty"},
+			Error:   &jsonRPCError{Code: JSONRPCInvalidRequest, Message: "Invalid request", Data: "Batch cannot be empty"},
 		})
 		return
 	}
@@ -402,7 +423,7 @@ func handleBatch(batch jsonRPCBatch, stdout io.Writer, stderr io.Writer) {
 			responses = append(responses, jsonRPCResponse{
 				JSONRPC: "2.0",
 				ID:      req.ID,
-				Error:   &jsonRPCError{Code: -32600, Message: "Invalid request", Data: "JSON-RPC version must be '2.0'"},
+				Error:   &jsonRPCError{Code: JSONRPCInvalidRequest, Message: "Invalid request", Data: "JSON-RPC version must be '2.0'"},
 			})
 			continue
 		}
@@ -411,7 +432,7 @@ func handleBatch(batch jsonRPCBatch, stdout io.Writer, stderr io.Writer) {
 			responses = append(responses, jsonRPCResponse{
 				JSONRPC: "2.0",
 				ID:      req.ID,
-				Error:   &jsonRPCError{Code: -32600, Message: "Invalid request", Data: "Method is required"},
+				Error:   &jsonRPCError{Code: JSONRPCInvalidRequest, Message: "Invalid request", Data: "Method is required"},
 			})
 			continue
 		}
@@ -447,7 +468,7 @@ func handleSingleRequest(req jsonRPCRequest, stdout io.Writer, stderr io.Writer)
 		writeJSON(stdout, jsonRPCResponse{
 			JSONRPC: "2.0",
 			ID:      req.ID,
-			Error:   &jsonRPCError{Code: -32600, Message: "Invalid request", Data: "JSON-RPC version must be '2.0'"},
+			Error:   &jsonRPCError{Code: JSONRPCInvalidRequest, Message: "Invalid request", Data: "JSON-RPC version must be '2.0'"},
 		})
 		return
 	}
@@ -456,13 +477,23 @@ func handleSingleRequest(req jsonRPCRequest, stdout io.Writer, stderr io.Writer)
 		writeJSON(stdout, jsonRPCResponse{
 			JSONRPC: "2.0",
 			ID:      req.ID,
-			Error:   &jsonRPCError{Code: -32600, Message: "Invalid request", Data: "Method is required"},
+			Error:   &jsonRPCError{Code: JSONRPCInvalidRequest, Message: "Invalid request", Data: "Method is required"},
 		})
 		return
 	}
 
-	// Handle request with timeout if it has an ID
+	// Validate ID requirements for requests (not notifications)
 	if req.ID != nil {
+		// Check for ID reuse (forbidden by MCP spec)
+		if _, exists := usedRequestIDs.LoadOrStore(req.ID, true); exists {
+			writeJSON(stdout, jsonRPCResponse{
+				JSONRPC: "2.0",
+				ID:      req.ID,
+				Error:   &jsonRPCError{Code: JSONRPCInvalidRequest, Message: "Invalid request", Data: "Request ID has been previously used in this session"},
+			})
+			return
+		}
+
 		go handleRequestWithTimeout(req, stdout, stderr)
 	} else {
 		// Notifications don't need timeout handling
@@ -501,7 +532,7 @@ func handleRequestWithTimeout(req jsonRPCRequest, stdout io.Writer, stderr io.Wr
 			JSONRPC: "2.0",
 			ID:      req.ID,
 			Error: &jsonRPCError{
-				Code:    -32000, // Server error
+				Code:    JSONRPCServerError, // Server error
 				Message: "Request timeout",
 				Data:    fmt.Sprintf("Request timed out after %v", defaultRequestTimeout),
 			},
@@ -518,7 +549,7 @@ func handleShutdown(stdout io.Writer, stderr io.Writer) {
 			JSONRPC: "2.0",
 			ID:      key,
 			Error: &jsonRPCError{
-				Code:    -32800, // Request cancelled
+				Code:    JSONRPCRequestCancelled, // Request cancelled
 				Message: "Request cancelled due to server shutdown",
 			},
 		}
@@ -533,6 +564,12 @@ func handleShutdown(stdout io.Writer, stderr io.Writer) {
 			tracker.sendProgress(100, floatPtr(100), "Operation cancelled due to server shutdown")
 		}
 		activeProgressTokens.Delete(key)
+		return true
+	})
+
+	// Clear used request IDs for next session
+	usedRequestIDs.Range(func(key, value interface{}) bool {
+		usedRequestIDs.Delete(key)
 		return true
 	})
 
@@ -659,7 +696,7 @@ func handleToolsCall(req jsonRPCRequest) jsonRPCResponse {
 	var p toolsCallParams
 	if len(req.Params) > 0 {
 		if err := json.Unmarshal(req.Params, &p); err != nil {
-			return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &jsonRPCError{Code: -32602, Message: "Invalid params", Data: err.Error()}}
+			return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &jsonRPCError{Code: JSONRPCInvalidParams, Message: "Invalid params", Data: err.Error()}}
 		}
 	}
 
@@ -674,13 +711,13 @@ func handleToolsCall(req jsonRPCRequest) jsonRPCResponse {
 	// Map arguments dynamically from Cobra
 	if argv, ok, verr := buildArgvFromCobraNormalized(p.Name, p.Arguments); ok {
 		if verr != nil {
-			return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &jsonRPCError{Code: -32602, Message: verr.Error()}}
+			return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &jsonRPCError{Code: JSONRPCInvalidParams, Message: verr.Error()}}
 		}
 		if len(argv) == 0 {
-			return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &jsonRPCError{Code: -32602, Message: "no arguments resolved"}}
+			return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &jsonRPCError{Code: JSONRPCInvalidParams, Message: "no arguments resolved"}}
 		}
 		if argv[0] == "mcp" {
-			return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &jsonRPCError{Code: -32602, Message: "calling mcp via MCP is not allowed"}}
+			return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &jsonRPCError{Code: JSONRPCInvalidParams, Message: "calling mcp via MCP is not allowed"}}
 		}
 		res := execApictlWithProgress(argv, progressTracker)
 		return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{
@@ -691,13 +728,13 @@ func handleToolsCall(req jsonRPCRequest) jsonRPCResponse {
 	// Fallback to explicit argv
 	argv, err := extractArgv(p)
 	if err != nil {
-		return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &jsonRPCError{Code: -32602, Message: "Invalid params", Data: err.Error()}}
+		return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &jsonRPCError{Code: JSONRPCInvalidParams, Message: "Invalid params", Data: err.Error()}}
 	}
 	if len(argv) == 0 {
-		return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &jsonRPCError{Code: -32602, Message: "argv is required"}}
+		return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &jsonRPCError{Code: JSONRPCInvalidParams, Message: "argv is required"}}
 	}
 	if argv[0] == "mcp" {
-		return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &jsonRPCError{Code: -32602, Message: "calling mcp via MCP is not allowed"}}
+		return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &jsonRPCError{Code: JSONRPCInvalidParams, Message: "calling mcp via MCP is not allowed"}}
 	}
 	res := execApictlWithProgress(argv, progressTracker)
 	return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{
