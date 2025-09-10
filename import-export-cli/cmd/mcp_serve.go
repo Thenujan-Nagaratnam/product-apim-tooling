@@ -31,6 +31,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unicode/utf8"
@@ -43,25 +44,15 @@ const mcpServeCmdLiteral = "serve"
 const mcpServeCmdShortDesc = "Start MCP server over stdio"
 const mcpServeCmdLongDesc = "Start a long-running Model Context Protocol (MCP) server over stdio for AI agents"
 
-// Security/resource limits
-// Max size of a single JSON-RPC line read from stdin. Increase if your payloads are larger.
 const maxRequestBytes = 4 * 1024 * 1024 // 4 MiB
 
-// Subprocess execution constraints
 const maxExecDuration = 60 * time.Second
 const maxOutputBytes = 4 * 1024 * 1024 // cap stdout/stderr per call
 
-// MCP Protocol timeouts and limits
 const defaultRequestTimeout = 30 * time.Second
 
-// Tool exposure configuration
-var toolMode string      // "all" | "minimal"
 var toolInclude []string // optional root-level allowlist
 var toolExclude []string // optional root-level denylist
-var minimalExcluded = map[string]struct{}{
-	"ai": {}, "bundle": {}, "gen": {}, "install": {}, "list": {}, "mcp": {}, "mi": {}, "mg": {},
-	"secret": {}, "k8s": {}, "aws": {}, "vcs": {}, "completion": {}, "uninstall": {},
-}
 
 type jsonRPCRequest struct {
 	JSONRPC string          `json:"jsonrpc"`
@@ -69,9 +60,6 @@ type jsonRPCRequest struct {
 	Method  string          `json:"method"`
 	Params  json.RawMessage `json:"params,omitempty"`
 }
-
-// jsonRPCBatch represents either a single request or an array of requests
-type jsonRPCBatch []jsonRPCRequest
 
 type jsonRPCResponse struct {
 	JSONRPC string        `json:"jsonrpc"`
@@ -86,7 +74,6 @@ type jsonRPCError struct {
 	Data    any    `json:"data,omitempty"`
 }
 
-// MCP Protocol structures
 type initializeParams struct {
 	ProtocolVersion string                 `json:"protocolVersion"`
 	Capabilities    map[string]interface{} `json:"capabilities"`
@@ -112,22 +99,21 @@ type initializeResult struct {
 
 // JSON-RPC 2.0 Error Codes (from specification)
 const (
-	JSONRPCParseError           = -32700 // Invalid JSON was received by the server
-	JSONRPCInvalidRequest       = -32600 // The JSON sent is not a valid Request object
-	JSONRPCMethodNotFound       = -32601 // The method does not exist / is not available
-	JSONRPCInvalidParams        = -32602 // Invalid method parameter(s)
-	JSONRPCInternalError        = -32603 // Internal JSON-RPC error
-	JSONRPCServerError          = -32000 // Server error (generic)
-	JSONRPCRequestCancelled     = -32800 // Request cancelled
-	JSONRPCServerNotInitialized = -32002 // Server not initialized
+	JSONRPCParseError           = -32700
+	JSONRPCInvalidRequest       = -32600
+	JSONRPCMethodNotFound       = -32601
+	JSONRPCInvalidParams        = -32602
+	JSONRPCInternalError        = -32603
+	JSONRPCServerError          = -32000
+	JSONRPCRequestCancelled     = -32800
+	JSONRPCServerNotInitialized = -32002
 )
 
-// Server state
-var isInitialized = false
+var isInitialized uint32 // 0 = false, 1 = true
 var shutdownChan = make(chan bool, 1)
-var pendingRequests = sync.Map{}      // track pending requests for timeout/cancellation
-var activeProgressTokens = sync.Map{} // track active progress tokens
-var usedRequestIDs = sync.Map{}       // track used request IDs to prevent reuse
+var pendingRequests = sync.Map{}
+var activeProgressTokens = sync.Map{}
+var usedRequestIDs = sync.Map{}
 
 // Serve MCP over stdio
 var mcpServeCmd = &cobra.Command{
@@ -142,7 +128,6 @@ var mcpServeCmd = &cobra.Command{
 func init() {
 	MCPCmd.AddCommand(mcpServeCmd)
 	// Flags to control exposed tools
-	mcpServeCmd.Flags().StringVar(&toolMode, "tool-mode", "all", "Tool exposure mode: all|minimal")
 	mcpServeCmd.Flags().StringSliceVar(&toolInclude, "tool-include", nil, "Comma-separated root commands to include (allowlist)")
 	mcpServeCmd.Flags().StringSliceVar(&toolExclude, "tool-exclude", nil, "Comma-separated root commands to exclude (denylist)")
 }
@@ -185,26 +170,14 @@ func runMCPServer(stdin io.Reader, stdout io.Writer, stderr io.Writer) {
 				continue
 			}
 
-			// Try to parse as a batch first, then as a single request
-			if bytes.HasPrefix(bytes.TrimSpace(line), []byte("[")) {
-				// Handle JSON-RPC batch
-				var batch jsonRPCBatch
-				if err := json.Unmarshal(line, &batch); err != nil {
-					logToStderr(stderr, fmt.Sprintf("Failed to parse JSON-RPC batch: %v", err))
-					writeJSON(stdout, jsonRPCResponse{JSONRPC: "2.0", Error: &jsonRPCError{Code: JSONRPCInvalidRequest, Message: "Invalid request", Data: err.Error()}})
-					continue
-				}
-				handleBatch(batch, stdout, stderr)
-			} else {
-				// Handle single JSON-RPC request
-				var req jsonRPCRequest
-				if err := json.Unmarshal(line, &req); err != nil {
-					logToStderr(stderr, fmt.Sprintf("Failed to parse JSON-RPC request: %v", err))
-					writeJSON(stdout, jsonRPCResponse{JSONRPC: "2.0", Error: &jsonRPCError{Code: JSONRPCInvalidRequest, Message: "Invalid request", Data: err.Error()}})
-					continue
-				}
-				handleSingleRequest(req, stdout, stderr)
+			// Handle single JSON-RPC request
+			var req jsonRPCRequest
+			if err := json.Unmarshal(line, &req); err != nil {
+				logToStderr(stderr, fmt.Sprintf("Failed to parse JSON-RPC request: %v", err))
+				writeJSON(stdout, jsonRPCResponse{JSONRPC: "2.0", Error: &jsonRPCError{Code: JSONRPCInvalidRequest, Message: "Invalid request", Data: err.Error()}})
+				continue
 			}
+			handleSingleRequest(req, stdout, stderr)
 		}
 		if err := scanner.Err(); err != nil {
 			scanDone <- err
@@ -282,7 +255,7 @@ func dispatchMCP(req jsonRPCRequest) jsonRPCResponse {
 	case "ping":
 		return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{}}
 	case "tools/list":
-		if !isInitialized {
+		if atomic.LoadUint32(&isInitialized) == 0 {
 			return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &jsonRPCError{
 				Code:    JSONRPCServerNotInitialized,
 				Message: "Server not initialized",
@@ -291,7 +264,7 @@ func dispatchMCP(req jsonRPCRequest) jsonRPCResponse {
 		}
 		return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{"tools": listCommandsAsTools()}}
 	case "tools/call":
-		if !isInitialized {
+		if atomic.LoadUint32(&isInitialized) == 0 {
 			return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &jsonRPCError{
 				Code:    JSONRPCServerNotInitialized,
 				Message: "Server not initialized",
@@ -331,21 +304,11 @@ func handleInitialize(req jsonRPCRequest) jsonRPCResponse {
 		}}
 	}
 
-	// Store negotiated version for potential future use
-
 	// Build server capabilities according to MCP specification
 	capabilities := map[string]interface{}{
 		"tools": map[string]interface{}{
 			"listChanged": true,
 		},
-		// Future: Could add prompts and resources capabilities
-		// "prompts": map[string]interface{}{
-		//     "listChanged": true,
-		// },
-		// "resources": map[string]interface{}{
-		//     "listChanged": true,
-		//     "subscribe": false,
-		// },
 	}
 
 	result := initializeResult{
@@ -362,7 +325,7 @@ func handleInitialize(req jsonRPCRequest) jsonRPCResponse {
 }
 
 func handleInitialized() jsonRPCResponse {
-	isInitialized = true
+	atomic.StoreUint32(&isInitialized, 1)
 	// Notifications don't require a response according to JSON-RPC spec
 	return jsonRPCResponse{} // Empty response (won't be written)
 }
@@ -400,66 +363,6 @@ func negotiateProtocolVersion(clientVersion string, supportedVersions []string) 
 	}
 
 	return ""
-}
-
-func handleBatch(batch jsonRPCBatch, stdout io.Writer, stderr io.Writer) {
-	if len(batch) == 0 {
-		logToStderr(stderr, "Received empty batch")
-		writeJSON(stdout, jsonRPCResponse{
-			JSONRPC: "2.0",
-			Error:   &jsonRPCError{Code: JSONRPCInvalidRequest, Message: "Invalid request", Data: "Batch cannot be empty"},
-		})
-		return
-	}
-
-	logToStderr(stderr, fmt.Sprintf("Processing batch of %d requests", len(batch)))
-
-	// Process each request in the batch
-	responses := make([]jsonRPCResponse, 0, len(batch))
-
-	for _, req := range batch {
-		// Validate each request in the batch
-		if req.JSONRPC != "2.0" {
-			responses = append(responses, jsonRPCResponse{
-				JSONRPC: "2.0",
-				ID:      req.ID,
-				Error:   &jsonRPCError{Code: JSONRPCInvalidRequest, Message: "Invalid request", Data: "JSON-RPC version must be '2.0'"},
-			})
-			continue
-		}
-
-		if req.Method == "" {
-			responses = append(responses, jsonRPCResponse{
-				JSONRPC: "2.0",
-				ID:      req.ID,
-				Error:   &jsonRPCError{Code: JSONRPCInvalidRequest, Message: "Invalid request", Data: "Method is required"},
-			})
-			continue
-		}
-
-		// Handle each request
-		if req.ID != nil {
-			// Request with ID - needs response
-			resp := dispatchMCP(req)
-			if resp.JSONRPC != "" {
-				responses = append(responses, resp)
-			}
-		} else {
-			// Notification - no response needed
-			dispatchMCP(req)
-		}
-	}
-
-	// Write batch response if there are any responses
-	if len(responses) > 0 {
-		if len(responses) == 1 {
-			// Single response - don't wrap in array
-			writeJSON(stdout, responses[0])
-		} else {
-			// Multiple responses - send as array
-			writeJSON(stdout, responses)
-		}
-	}
 }
 
 func handleSingleRequest(req jsonRPCRequest, stdout io.Writer, stderr io.Writer) {
@@ -594,6 +497,10 @@ func listCommandsAsTools() []map[string]any {
 			if len(prefix) == 0 && child == MCPCmd {
 				continue
 			}
+			// Skip deprecated commands
+			if child.Deprecated != "" {
+				continue
+			}
 
 			path := append(prefix, child.Name())
 
@@ -632,12 +539,6 @@ func shouldExposeRoot(root string) bool {
 			}
 		}
 	}
-	// Minimal mode blocks a predefined set
-	if strings.EqualFold(toolMode, "minimal") {
-		if _, blocked := minimalExcluded[r]; blocked {
-			return false
-		}
-	}
 	return true
 }
 
@@ -655,6 +556,11 @@ func getRequiredFlags(cmd *cobra.Command) (req []string, oneOf []string) {
 
 func generateToolForCommand(name string, c *cobra.Command) map[string]any {
 	props := map[string]any{}
+
+	// Add positional arguments based on command usage and examples
+	addPositionalArguments(name, c, props)
+
+	// Add flags
 	c.Flags().VisitAll(func(f *pflag.Flag) {
 		if f.Hidden {
 			return
@@ -677,7 +583,13 @@ func generateToolForCommand(name string, c *cobra.Command) map[string]any {
 			}
 		}
 	})
+
 	req, oneOf := getRequiredFlags(c)
+
+	// Add positional arguments to required fields
+	positionalRequired := getPositionalRequired(name, c)
+	req = append(req, positionalRequired...)
+
 	schema := map[string]any{"type": "object", "properties": props}
 	if len(req) > 0 {
 		schema["required"] = req
@@ -708,37 +620,48 @@ func handleToolsCall(req jsonRPCRequest) jsonRPCResponse {
 		defer progressTracker.cleanup()
 	}
 
-	// Map arguments dynamically from Cobra
-	if argv, ok, verr := buildArgvFromCobraNormalized(p.Name, p.Arguments); ok {
+	// Resolve command and arguments to an argv array
+	var argv []string
+	var err error
+
+	if resolvedArgv, ok, verr := buildArgvFromCobraNormalized(p.Name, p.Arguments); ok {
 		if verr != nil {
 			return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &jsonRPCError{Code: JSONRPCInvalidParams, Message: verr.Error()}}
 		}
-		if len(argv) == 0 {
-			return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &jsonRPCError{Code: JSONRPCInvalidParams, Message: "no arguments resolved"}}
+		argv = resolvedArgv
+	} else {
+		// Fallback to explicit argv extraction
+		argv, err = extractArgv(p)
+		if err != nil {
+			return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &jsonRPCError{Code: JSONRPCInvalidParams, Message: "Invalid params", Data: err.Error()}}
 		}
-		if argv[0] == "mcp" {
-			return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &jsonRPCError{Code: JSONRPCInvalidParams, Message: "calling mcp via MCP is not allowed"}}
-		}
-		res := execApictlWithProgress(argv, progressTracker)
-		return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{
-			"content": []map[string]any{{"type": "text", "text": res.Stdout}},
-			"isError": res.ExitCode != 0,
-		}}
 	}
-	// Fallback to explicit argv
-	argv, err := extractArgv(p)
-	if err != nil {
-		return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &jsonRPCError{Code: JSONRPCInvalidParams, Message: "Invalid params", Data: err.Error()}}
-	}
+
+	// Validate and execute the command
 	if len(argv) == 0 {
-		return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &jsonRPCError{Code: JSONRPCInvalidParams, Message: "argv is required"}}
+		// This can happen if name is empty and no argv/args are provided.
+		return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &jsonRPCError{Code: JSONRPCInvalidParams, Message: "No command or arguments provided"}}
 	}
 	if argv[0] == "mcp" {
 		return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &jsonRPCError{Code: JSONRPCInvalidParams, Message: "calling mcp via MCP is not allowed"}}
 	}
+
 	res := execApictlWithProgress(argv, progressTracker)
+
+	// Combine stdout and stderr for better error reporting
+	var output string
+	if res.Stdout != "" && res.Stderr != "" {
+		output = res.Stdout + "\n" + res.Stderr
+	} else if res.Stdout != "" {
+		output = res.Stdout
+	} else if res.Stderr != "" {
+		output = res.Stderr
+	} else {
+		output = fmt.Sprintf("Exit status %d", res.ExitCode)
+	}
+
 	return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{
-		"content": []map[string]any{{"type": "text", "text": res.Stdout}},
+		"content": []map[string]any{{"type": "text", "text": output}},
 		"isError": res.ExitCode != 0,
 	}}
 }
@@ -776,7 +699,10 @@ func buildArgvFromCobraNormalized(name string, args map[string]any) ([]string, b
 			}
 		}
 	})
-	// append user-provided positionals/argv
+	// Handle positional arguments based on command type
+	handlePositionalArguments(name, args, &argv)
+
+	// append user-provided positionals/argv (fallback)
 	if raw, ok := args["argv"]; ok {
 		if arr, ok := raw.([]any); ok {
 			for _, v := range arr {
@@ -978,11 +904,43 @@ func extractArgv(p toolsCallParams) ([]string, error) {
 		}
 		return nil, fmt.Errorf("argv must be an array of strings")
 	}
-	// fallback: name as command path; optional args string
+
+	// Build command from name and handle positional arguments
 	var parts []string
 	if strings.TrimSpace(p.Name) != "" {
 		parts = strings.Fields(p.Name)
 	}
+
+	// Handle positional arguments based on command type (same logic as buildArgvFromCobraNormalized)
+	handlePositionalArguments(p.Name, p.Arguments, &parts)
+
+	// Handle flags (try to resolve command to get flag definitions)
+	cmd := resolveCommandByPath(p.Name)
+	if cmd != nil {
+		cmd.Flags().VisitAll(func(f *pflag.Flag) {
+			if f.Hidden {
+				return
+			}
+			long := f.Name
+			camel := kebabToCamel(long)
+			if v, ok := p.Arguments[long]; ok {
+				appendFlagArg(&parts, f, v)
+				return
+			}
+			if v, ok := p.Arguments[camel]; ok {
+				appendFlagArg(&parts, f, v)
+				return
+			}
+			if f.Shorthand != "" {
+				if v, ok := p.Arguments[f.Shorthand]; ok {
+					appendFlagArg(&parts, f, v)
+					return
+				}
+			}
+		})
+	}
+
+	// fallback: name as command path; optional args string
 	if raw, ok := p.Arguments["args"]; ok {
 		if s, ok := raw.(string); ok && strings.TrimSpace(s) != "" {
 			parts = append(parts, splitShellLike(s)...)
@@ -1042,10 +1000,6 @@ type apictlExecResult struct {
 	Stdout   string `json:"stdout"`
 	Stderr   string `json:"stderr"`
 	ExitCode int    `json:"exitCode"`
-}
-
-func execApictl(argv []string) apictlExecResult {
-	return execApictlWithProgress(argv, nil)
 }
 
 func execApictlWithProgress(argv []string, tracker *progressTracker) apictlExecResult {
@@ -1182,4 +1136,191 @@ func safeTruncate(s string, max int) string {
 		return s
 	}
 	return s[:max]
+}
+
+// addPositionalArguments adds positional argument fields to the tool schema
+func addPositionalArguments(name string, c *cobra.Command, props map[string]any) {
+	// Parse command name to understand the command type
+	// Handle both space-separated and underscore-separated command names
+	parts := strings.Fields(strings.ReplaceAll(name, "_", " "))
+	if len(parts) == 0 {
+		return
+	}
+
+	command := parts[0]
+
+	// Handle specific commands that need positional arguments
+	switch {
+	case command == "init":
+		props["projectName"] = map[string]any{
+			"type":        "string",
+			"description": "Name of the API project to initialize (e.g., 'Petstore', 'MyAPI')",
+		}
+
+	case command == "add" && len(parts) > 1 && parts[1] == "env":
+		props["environmentName"] = map[string]any{
+			"type":        "string",
+			"description": "Name of the environment to add (e.g., 'dev', 'prod', 'staging')",
+		}
+
+	case command == "remove" && len(parts) > 1 && parts[1] == "env":
+		props["environmentName"] = map[string]any{
+			"type":        "string",
+			"description": "Name of the environment to remove",
+		}
+
+	case command == "login":
+		props["environment"] = map[string]any{
+			"type":        "string",
+			"description": "Environment name to login to (e.g., 'dev', 'prod')",
+		}
+
+	case command == "logout":
+		props["environment"] = map[string]any{
+			"type":        "string",
+			"description": "Environment name to logout from",
+		}
+
+	case strings.HasPrefix(command, "mg"):
+		// Microgateway commands
+		if len(parts) >= 3 {
+			subcommand := parts[1]
+			switch subcommand {
+			case "add":
+				if len(parts) >= 4 && parts[2] == "env" {
+					props["environmentName"] = map[string]any{
+						"type":        "string",
+						"description": "Name of the environment to add",
+					}
+				}
+			case "remove":
+				if len(parts) >= 4 && parts[2] == "env" {
+					props["environmentName"] = map[string]any{
+						"type":        "string",
+						"description": "Name of the environment to remove",
+					}
+				}
+			case "login":
+				props["environment"] = map[string]any{
+					"type":        "string",
+					"description": "Environment name to login to",
+				}
+			case "logout":
+				props["environment"] = map[string]any{
+					"type":        "string",
+					"description": "Environment name to logout from",
+				}
+			}
+		}
+	}
+}
+
+// getPositionalRequired returns the required positional argument field names
+func getPositionalRequired(name string, c *cobra.Command) []string {
+	var required []string
+
+	// Handle both space-separated and underscore-separated command names
+	parts := strings.Fields(strings.ReplaceAll(name, "_", " "))
+	if len(parts) == 0 {
+		return required
+	}
+
+	command := parts[0]
+
+	switch {
+	case command == "init":
+		required = append(required, "projectName")
+
+	case command == "add" && len(parts) > 1 && parts[1] == "env":
+		required = append(required, "environmentName")
+
+	case command == "remove" && len(parts) > 1 && parts[1] == "env":
+		required = append(required, "environmentName")
+
+	case command == "login":
+		required = append(required, "environment")
+
+	case command == "logout":
+		required = append(required, "environment")
+
+	case strings.HasPrefix(command, "mg"):
+		if len(parts) >= 3 {
+			subcommand := parts[1]
+			switch subcommand {
+			case "add":
+				if len(parts) >= 4 && parts[2] == "env" {
+					required = append(required, "environmentName")
+				}
+			case "remove":
+				if len(parts) >= 4 && parts[2] == "env" {
+					required = append(required, "environmentName")
+				}
+			case "login", "logout":
+				required = append(required, "environment")
+			}
+		}
+	}
+
+	return required
+}
+
+// handlePositionalArguments processes positional arguments and adds them to argv
+func handlePositionalArguments(name string, args map[string]any, argv *[]string) {
+	// Handle both space-separated and underscore-separated command names
+	parts := strings.Fields(strings.ReplaceAll(name, "_", " "))
+	if len(parts) == 0 {
+		return
+	}
+
+	command := parts[0]
+
+	switch {
+	case command == "init":
+		if projectName, ok := args["projectName"].(string); ok && projectName != "" {
+			*argv = append(*argv, projectName)
+		}
+
+	case command == "add" && len(parts) > 1 && parts[1] == "env":
+		if envName, ok := args["environmentName"].(string); ok && envName != "" {
+			*argv = append(*argv, envName)
+		}
+
+	case command == "remove" && len(parts) > 1 && parts[1] == "env":
+		if envName, ok := args["environmentName"].(string); ok && envName != "" {
+			*argv = append(*argv, envName)
+		}
+
+	case command == "login":
+		if env, ok := args["environment"].(string); ok && env != "" {
+			*argv = append(*argv, env)
+		}
+
+	case command == "logout":
+		if env, ok := args["environment"].(string); ok && env != "" {
+			*argv = append(*argv, env)
+		}
+
+	case strings.HasPrefix(command, "mg"):
+		if len(parts) >= 3 {
+			subcommand := parts[1]
+			switch subcommand {
+			case "add":
+				if len(parts) >= 4 && parts[2] == "env" {
+					if envName, ok := args["environmentName"].(string); ok && envName != "" {
+						*argv = append(*argv, envName)
+					}
+				}
+			case "remove":
+				if len(parts) >= 4 && parts[2] == "env" {
+					if envName, ok := args["environmentName"].(string); ok && envName != "" {
+						*argv = append(*argv, envName)
+					}
+				}
+			case "login", "logout":
+				if env, ok := args["environment"].(string); ok && env != "" {
+					*argv = append(*argv, env)
+				}
+			}
+		}
+	}
 }
