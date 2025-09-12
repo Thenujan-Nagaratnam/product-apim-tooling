@@ -318,7 +318,7 @@ func handleInitialize(req jsonRPCRequest) jsonRPCResponse {
 			Name:    "apictl",
 			Version: "1.0",
 		},
-		Instructions: "This MCP server exposes WSO2 API Manager CLI (apictl) commands as tools. Ensure you're authenticated with your target environments using 'apictl login <env>' before using the tools.",
+		Instructions: "This MCP server exposes WSO2 API Manager CLI (apictl) commands as tools. Note: Login and logout commands are not available through this MCP interface. Ensure you're authenticated with your target environments using 'apictl login <env>' in your terminal before using the tools.",
 	}
 
 	return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Result: result}
@@ -506,7 +506,7 @@ func listCommandsAsTools() []map[string]any {
 
 			// Only include leaf runnable commands
 			if (child.Run != nil || child.RunE != nil) && len(child.Commands()) == 0 {
-				if shouldExposeRoot(path[0]) {
+				if shouldExposeRoot(path[0]) && shouldExposeCommand(strings.Join(path, " ")) {
 					tools = append(tools, generateToolForCommand(strings.Join(path, " "), child))
 				}
 			}
@@ -539,6 +539,18 @@ func shouldExposeRoot(root string) bool {
 			}
 		}
 	}
+	return true
+}
+
+// shouldExposeCommand decides if a specific command should be exposed as a tool
+func shouldExposeCommand(commandPath string) bool {
+	cmd := strings.ToLower(strings.TrimSpace(commandPath))
+
+	// Exclude login and logout commands
+	if strings.Contains(cmd, "login") || strings.Contains(cmd, "logout") || strings.Contains(cmd, "completion") {
+		return false
+	}
+
 	return true
 }
 
@@ -1140,124 +1152,103 @@ func safeTruncate(s string, max int) string {
 
 // addPositionalArguments adds positional argument fields to the tool schema
 func addPositionalArguments(name string, c *cobra.Command, props map[string]any) {
-	// Parse command name to understand the command type
-	// Handle both space-separated and underscore-separated command names
-	parts := strings.Fields(strings.ReplaceAll(name, "_", " "))
-	if len(parts) == 0 {
-		return
-	}
-
-	command := parts[0]
-
-	// Handle specific commands that need positional arguments
-	switch {
-	case command == "init":
-		props["projectName"] = map[string]any{
-			"type":        "string",
-			"description": "Name of the API project to initialize (e.g., 'Petstore', 'MyAPI')",
-		}
-
-	case command == "add" && len(parts) > 1 && parts[1] == "env":
-		props["environmentName"] = map[string]any{
-			"type":        "string",
-			"description": "Name of the environment to add (e.g., 'dev', 'prod', 'staging')",
-		}
-
-	case command == "remove" && len(parts) > 1 && parts[1] == "env":
-		props["environmentName"] = map[string]any{
-			"type":        "string",
-			"description": "Name of the environment to remove",
-		}
-
-	case command == "login":
-		props["environment"] = map[string]any{
-			"type":        "string",
-			"description": "Environment name to login to (e.g., 'dev', 'prod')",
-		}
-
-	case command == "logout":
-		props["environment"] = map[string]any{
-			"type":        "string",
-			"description": "Environment name to logout from",
-		}
-
-	case strings.HasPrefix(command, "mg"):
-		// Microgateway commands
-		if len(parts) >= 3 {
-			subcommand := parts[1]
-			switch subcommand {
-			case "add":
-				if len(parts) >= 4 && parts[2] == "env" {
-					props["environmentName"] = map[string]any{
-						"type":        "string",
-						"description": "Name of the environment to add",
-					}
-				}
-			case "remove":
-				if len(parts) >= 4 && parts[2] == "env" {
-					props["environmentName"] = map[string]any{
-						"type":        "string",
-						"description": "Name of the environment to remove",
-					}
-				}
-			case "login":
-				props["environment"] = map[string]any{
-					"type":        "string",
-					"description": "Environment name to login to",
-				}
-			case "logout":
-				props["environment"] = map[string]any{
-					"type":        "string",
-					"description": "Environment name to logout from",
-				}
+	// Use Cobra's built-in argument validation to determine positional arguments
+	if c.Args != nil {
+		// Create a mock validation function to extract argument requirements
+		argSpec := extractArgumentSpec(c)
+		for i, arg := range argSpec {
+			argName := fmt.Sprintf("arg%d", i+1)
+			if arg.Name != "" {
+				argName = arg.Name
+			}
+			props[argName] = map[string]any{
+				"type":        "string",
+				"description": arg.Description,
 			}
 		}
 	}
+}
+
+// argumentSpec represents a positional argument specification
+type argumentSpec struct {
+	Name        string
+	Description string
+	Required    bool
+}
+
+// extractArgumentSpec extracts argument specifications from Cobra command
+func extractArgumentSpec(c *cobra.Command) []argumentSpec {
+	var specs []argumentSpec
+
+	// Always check command path first for common patterns
+	commandPath := c.CommandPath()
+	if strings.Contains(commandPath, "init") {
+		specs = append(specs, argumentSpec{
+			Name:        "projectName",
+			Description: "Name of the API project to initialize",
+			Required:    true,
+		})
+	} else if strings.Contains(commandPath, "login") || strings.Contains(commandPath, "logout") {
+		specs = append(specs, argumentSpec{
+			Name:        "environment",
+			Description: "Environment name",
+			Required:    true,
+		})
+	} else if strings.Contains(commandPath, "add env") || strings.Contains(commandPath, "remove env") {
+		specs = append(specs, argumentSpec{
+			Name:        "environmentName",
+			Description: "Name of the environment",
+			Required:    true,
+		})
+	}
+
+	// If no specs found, try to extract from usage string
+	if len(specs) == 0 && c.Args != nil {
+		usage := c.Use
+
+		// Parse usage string to extract argument patterns
+		if strings.Contains(usage, "[environment]") {
+			specs = append(specs, argumentSpec{
+				Name:        "environment",
+				Description: "Environment name",
+				Required:    true,
+			})
+		}
+		if strings.Contains(usage, "[environment-name]") {
+			specs = append(specs, argumentSpec{
+				Name:        "environmentName",
+				Description: "Name of the environment",
+				Required:    true,
+			})
+		}
+		if strings.Contains(usage, "[project-name]") || strings.Contains(usage, "<project-name>") {
+			specs = append(specs, argumentSpec{
+				Name:        "projectName",
+				Description: "Name of the project",
+				Required:    true,
+			})
+		}
+		if strings.Contains(usage, "[name]") && !strings.Contains(usage, "environment") {
+			specs = append(specs, argumentSpec{
+				Name:        "name",
+				Description: "Name parameter",
+				Required:    true,
+			})
+		}
+	}
+
+	return specs
 }
 
 // getPositionalRequired returns the required positional argument field names
 func getPositionalRequired(name string, c *cobra.Command) []string {
 	var required []string
 
-	// Handle both space-separated and underscore-separated command names
-	parts := strings.Fields(strings.ReplaceAll(name, "_", " "))
-	if len(parts) == 0 {
-		return required
-	}
-
-	command := parts[0]
-
-	switch {
-	case command == "init":
-		required = append(required, "projectName")
-
-	case command == "add" && len(parts) > 1 && parts[1] == "env":
-		required = append(required, "environmentName")
-
-	case command == "remove" && len(parts) > 1 && parts[1] == "env":
-		required = append(required, "environmentName")
-
-	case command == "login":
-		required = append(required, "environment")
-
-	case command == "logout":
-		required = append(required, "environment")
-
-	case strings.HasPrefix(command, "mg"):
-		if len(parts) >= 3 {
-			subcommand := parts[1]
-			switch subcommand {
-			case "add":
-				if len(parts) >= 4 && parts[2] == "env" {
-					required = append(required, "environmentName")
-				}
-			case "remove":
-				if len(parts) >= 4 && parts[2] == "env" {
-					required = append(required, "environmentName")
-				}
-			case "login", "logout":
-				required = append(required, "environment")
-			}
+	// Use the same argument specification extraction
+	argSpecs := extractArgumentSpec(c)
+	for _, spec := range argSpecs {
+		if spec.Required {
+			required = append(required, spec.Name)
 		}
 	}
 
@@ -1266,61 +1257,19 @@ func getPositionalRequired(name string, c *cobra.Command) []string {
 
 // handlePositionalArguments processes positional arguments and adds them to argv
 func handlePositionalArguments(name string, args map[string]any, argv *[]string) {
-	// Handle both space-separated and underscore-separated command names
-	parts := strings.Fields(strings.ReplaceAll(name, "_", " "))
-	if len(parts) == 0 {
+	// Try to resolve the command to get its argument specifications
+	cmd := resolveCommandByPath(name)
+	if cmd == nil {
 		return
 	}
 
-	command := parts[0]
+	// Get argument specifications for this command
+	argSpecs := extractArgumentSpec(cmd)
 
-	switch {
-	case command == "init":
-		if projectName, ok := args["projectName"].(string); ok && projectName != "" {
-			*argv = append(*argv, projectName)
-		}
-
-	case command == "add" && len(parts) > 1 && parts[1] == "env":
-		if envName, ok := args["environmentName"].(string); ok && envName != "" {
-			*argv = append(*argv, envName)
-		}
-
-	case command == "remove" && len(parts) > 1 && parts[1] == "env":
-		if envName, ok := args["environmentName"].(string); ok && envName != "" {
-			*argv = append(*argv, envName)
-		}
-
-	case command == "login":
-		if env, ok := args["environment"].(string); ok && env != "" {
-			*argv = append(*argv, env)
-		}
-
-	case command == "logout":
-		if env, ok := args["environment"].(string); ok && env != "" {
-			*argv = append(*argv, env)
-		}
-
-	case strings.HasPrefix(command, "mg"):
-		if len(parts) >= 3 {
-			subcommand := parts[1]
-			switch subcommand {
-			case "add":
-				if len(parts) >= 4 && parts[2] == "env" {
-					if envName, ok := args["environmentName"].(string); ok && envName != "" {
-						*argv = append(*argv, envName)
-					}
-				}
-			case "remove":
-				if len(parts) >= 4 && parts[2] == "env" {
-					if envName, ok := args["environmentName"].(string); ok && envName != "" {
-						*argv = append(*argv, envName)
-					}
-				}
-			case "login", "logout":
-				if env, ok := args["environment"].(string); ok && env != "" {
-					*argv = append(*argv, env)
-				}
-			}
+	// Add positional arguments in order
+	for _, spec := range argSpecs {
+		if value, ok := args[spec.Name].(string); ok && value != "" {
+			*argv = append(*argv, value)
 		}
 	}
 }
