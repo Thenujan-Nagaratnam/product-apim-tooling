@@ -41,20 +41,26 @@ import (
 	"github.com/spf13/pflag"
 )
 
-const mcpServeCmdLiteral = "serve"
-const mcpServeCmdShortDesc = "Start MCP server over stdio"
-const mcpServeCmdLongDesc = "Start a long-running Model Context Protocol (MCP) server over stdio for AI agents"
+// MCP command configuration
+const (
+	mcpServeCmdLiteral   = "serve"
+	mcpServeCmdShortDesc = "Start MCP server over stdio"
+	mcpServeCmdLongDesc  = "Start a long-running Model Context Protocol (MCP) server over stdio for AI agents"
+)
 
-const maxRequestBytes = 4 * 1024 * 1024 // 4 MiB
-
-const maxExecDuration = 60 * time.Second
-const maxOutputBytes = 4 * 1024 * 1024 // cap stdout/stderr per call
-
-const defaultRequestTimeout = 30 * time.Second
+// Resource limits and timeouts
+const (
+	maxRequestBytes       = 4 * 1024 * 1024  // 4 MiB maximum request size
+	maxOutputBytes        = 4 * 1024 * 1024  // 4 MiB maximum output per command execution
+	maxExecDuration       = 60 * time.Second // Maximum execution time for tools
+	defaultRequestTimeout = 30 * time.Second // Default timeout for JSON-RPC requests
+)
 
 // Pagination configuration
-const defaultPageSize = 75
-const maxPageSize = 200
+const (
+	defaultPageSize = 75  // Default number of items per page
+	maxPageSize     = 200 // Maximum allowed page size
+)
 
 var toolInclude []string // optional root-level allowlist
 var toolExclude []string // optional root-level denylist
@@ -115,24 +121,89 @@ const (
 	JSONRPCServerNotInitialized = -32002
 )
 
-var isInitialized uint32 // 0 = false, 1 = true
-var shutdownChan = make(chan bool, 1)
-var pendingRequests = sync.Map{}
-var activeProgressTokens = sync.Map{}
-var usedRequestIDs = sync.Map{}
+// Standard JSON-RPC error constructors for consistency
+func newJSONRPCError(code int, message string, data interface{}) *jsonRPCError {
+	return &jsonRPCError{
+		Code:    code,
+		Message: message,
+		Data:    data,
+	}
+}
 
-// Security and rate limiting
-var toolCallCounts = sync.Map{}   // map[string]int for rate limiting
-var lastToolCallTime = sync.Map{} // map[string]time.Time for rate limiting
-const maxToolCallsPerMinute = 60
-const rateLimitWindow = time.Minute
+func newParseError(data interface{}) *jsonRPCError {
+	return newJSONRPCError(JSONRPCParseError, "Parse error", data)
+}
 
-// Logging configuration
-var currentLogLevel = "info"      // Default log level
-var logMessageCounts = sync.Map{} // map[string]int for log rate limiting
-var lastLogTime = sync.Map{}      // map[string]time.Time for log rate limiting
-const maxLogMessagesPerMinute = 100
-const logRateLimitWindow = time.Minute
+func newInvalidRequestError(data interface{}) *jsonRPCError {
+	return newJSONRPCError(JSONRPCInvalidRequest, "Invalid request", data)
+}
+
+func newMethodNotFoundError(method string) *jsonRPCError {
+	return newJSONRPCError(JSONRPCMethodNotFound, "Method not found", map[string]interface{}{
+		"method":    method,
+		"available": []string{"initialize", "notifications/initialized", "notifications/cancelled", "ping", "tools/list", "tools/call", "logging/setLevel"},
+	})
+}
+
+func newInvalidParamsError(data interface{}) *jsonRPCError {
+	return newJSONRPCError(JSONRPCInvalidParams, "Invalid params", data)
+}
+
+func newInternalError(data interface{}) *jsonRPCError {
+	return newJSONRPCError(JSONRPCInternalError, "Internal error", data)
+}
+
+func newServerError(message string, data interface{}) *jsonRPCError {
+	return newJSONRPCError(JSONRPCServerError, message, data)
+}
+
+func newNotInitializedError() *jsonRPCError {
+	return newJSONRPCError(JSONRPCServerNotInitialized, "Server not initialized", "Call 'initialize' method first")
+}
+
+// Helper functions for common validation patterns
+func validateAndUnmarshalParams(reqParams json.RawMessage, target interface{}) *jsonRPCError {
+	if len(reqParams) > 0 {
+		if err := json.Unmarshal(reqParams, target); err != nil {
+			return newInvalidParamsError(err.Error())
+		}
+	}
+	return nil
+}
+
+func requireServerInitialized() *jsonRPCError {
+	if atomic.LoadUint32(&isInitialized) == 0 {
+		return newNotInitializedError()
+	}
+	return nil
+}
+
+// Rate limiting configuration
+const (
+	maxToolCallsPerMinute    = 60                     // Maximum tool calls per minute per tool
+	rateLimitWindow          = time.Minute            // Rate limiting time window
+	maxLogMessagesPerMinute  = 100                    // Maximum log messages per minute per logger
+	logRateLimitWindow       = time.Minute            // Log rate limiting time window
+	defaultProgressRateLimit = 100 * time.Millisecond // Minimum time between progress updates
+)
+
+// Global state and synchronization
+var (
+	isInitialized        uint32 = 0                  // Atomic flag: 0 = false, 1 = true
+	shutdownChan                = make(chan bool, 1) // Channel for shutdown signaling
+	pendingRequests             = sync.Map{}         // Active JSON-RPC requests
+	activeProgressTokens        = sync.Map{}         // Active progress tracking tokens
+	usedRequestIDs              = sync.Map{}         // Prevents request ID reuse
+	currentLogLevel             = "info"             // Current logging level
+)
+
+// Rate limiting state
+var (
+	toolCallCounts   = sync.Map{} // Tool call counts per minute
+	lastToolCallTime = sync.Map{} // Last tool call timestamps
+	logMessageCounts = sync.Map{} // Log message counts per minute
+	lastLogTime      = sync.Map{} // Last log message timestamps
+)
 
 // Log levels following RFC 5424 syslog severity levels
 const (
@@ -204,7 +275,17 @@ func runMCPServer(stdin io.Reader, stdout io.Writer, stderr io.Writer) {
 				logToStderr(stderr, "Received non-UTF-8 encoded message")
 				writeJSON(stdout, jsonRPCResponse{
 					JSONRPC: "2.0",
-					Error:   &jsonRPCError{Code: JSONRPCInvalidRequest, Message: "Invalid request", Data: "Message must be UTF-8 encoded"},
+					Error:   newInvalidRequestError("Message must be UTF-8 encoded"),
+				})
+				continue
+			}
+
+			// Check message size limits
+			if len(line) > maxRequestBytes {
+				logToStderr(stderr, fmt.Sprintf("Received oversized message: %d bytes", len(line)))
+				writeJSON(stdout, jsonRPCResponse{
+					JSONRPC: "2.0",
+					Error:   newInvalidRequestError(fmt.Sprintf("Message too large: %d bytes (max: %d)", len(line), maxRequestBytes)),
 				})
 				continue
 			}
@@ -214,7 +295,7 @@ func runMCPServer(stdin io.Reader, stdout io.Writer, stderr io.Writer) {
 				logToStderr(stderr, "Received message with embedded newlines")
 				writeJSON(stdout, jsonRPCResponse{
 					JSONRPC: "2.0",
-					Error:   &jsonRPCError{Code: JSONRPCInvalidRequest, Message: "Invalid request", Data: "Messages must not contain embedded newlines"},
+					Error:   newInvalidRequestError("Messages must not contain embedded newlines"),
 				})
 				continue
 			}
@@ -223,7 +304,7 @@ func runMCPServer(stdin io.Reader, stdout io.Writer, stderr io.Writer) {
 			var req jsonRPCRequest
 			if err := json.Unmarshal(line, &req); err != nil {
 				logToStderr(stderr, fmt.Sprintf("Failed to parse JSON-RPC request: %v", err))
-				writeJSON(stdout, jsonRPCResponse{JSONRPC: "2.0", Error: &jsonRPCError{Code: JSONRPCInvalidRequest, Message: "Invalid request", Data: err.Error()}})
+				writeJSON(stdout, jsonRPCResponse{JSONRPC: "2.0", Error: newParseError(err.Error())})
 				continue
 			}
 			handleSingleRequest(req, stdout, stderr)
@@ -236,15 +317,15 @@ func runMCPServer(stdin io.Reader, stdout io.Writer, stderr io.Writer) {
 	// Wait for shutdown signal or scanner completion
 	select {
 	case sig := <-sigChan:
-		logToStderr(stderr, fmt.Sprintf("Received signal %v, shutting down gracefully...", sig))
+		logInfo(stderr, "server", "Received shutdown signal", map[string]interface{}{"signal": sig.String()})
 		handleShutdown(stdout, stderr)
 	case err := <-scanDone:
 		if err != nil {
-			logToStderr(stderr, fmt.Sprintf("Scanner error: %v", err))
+			logError(stderr, "scanner", "Scanner error", map[string]interface{}{"error": err.Error()})
 		}
-		logToStderr(stderr, "Input stream closed, shutting down...")
+		logInfo(stderr, "server", "Input stream closed, shutting down", nil)
 	case <-shutdownChan:
-		logToStderr(stderr, "Server shutdown requested...")
+		logInfo(stderr, "server", "Server shutdown requested", nil)
 	}
 
 	// Wait a bit for any pending operations to complete
@@ -255,9 +336,13 @@ func writeJSON(w io.Writer, v any) {
 	data, err := json.Marshal(v)
 	if err != nil {
 		// last resort write an internal error
-		_fallback := jsonRPCResponse{JSONRPC: "2.0", Error: &jsonRPCError{Code: JSONRPCInternalError, Message: "Internal error", Data: err.Error()}}
-		b, _ := json.Marshal(_fallback)
-		writeValidatedJSON(w, b)
+		fallbackResp := jsonRPCResponse{JSONRPC: "2.0", Error: newInternalError(err.Error())}
+		if b, marshalErr := json.Marshal(fallbackResp); marshalErr == nil {
+			writeValidatedJSON(w, b)
+		} else {
+			// Absolute fallback - write static error
+			writeValidatedJSON(w, []byte(`{"jsonrpc":"2.0","error":{"code":-32603,"message":"Internal error"}}`))
+		}
 		return
 	}
 	writeValidatedJSON(w, data)
@@ -290,7 +375,34 @@ func logToStderr(stderr io.Writer, message string) {
 	if !utf8.ValidString(message) {
 		message = "Invalid UTF-8 log message"
 	}
-	fmt.Fprintf(stderr, "[MCP Server] %s\n", message)
+	timestamp := time.Now().Format(time.RFC3339)
+	fmt.Fprintf(stderr, "[MCP Server] %s %s\n", timestamp, message)
+}
+
+// Structured logging functions for better consistency
+func logInfo(stderr io.Writer, component string, message string, details map[string]interface{}) {
+	logStructured(stderr, "INFO", component, message, details)
+}
+
+func logWarning(stderr io.Writer, component string, message string, details map[string]interface{}) {
+	logStructured(stderr, "WARN", component, message, details)
+}
+
+func logError(stderr io.Writer, component string, message string, details map[string]interface{}) {
+	logStructured(stderr, "ERROR", component, message, details)
+}
+
+func logStructured(stderr io.Writer, level, component, message string, details map[string]interface{}) {
+	timestamp := time.Now().Format(time.RFC3339)
+	logEntry := fmt.Sprintf("[MCP Server] %s [%s] %s: %s", timestamp, level, component, message)
+
+	if len(details) > 0 {
+		if detailsJSON, err := json.Marshal(details); err == nil {
+			logEntry += fmt.Sprintf(" %s", string(detailsJSON))
+		}
+	}
+
+	fmt.Fprintln(stderr, logEntry)
 }
 
 func dispatchMCP(req jsonRPCRequest) jsonRPCResponse {
@@ -304,50 +416,29 @@ func dispatchMCP(req jsonRPCRequest) jsonRPCResponse {
 	case "ping":
 		return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{}}
 	case "tools/list":
-		if atomic.LoadUint32(&isInitialized) == 0 {
-			return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &jsonRPCError{
-				Code:    JSONRPCServerNotInitialized,
-				Message: "Server not initialized",
-				Data:    "Call 'initialize' method first",
-			}}
+		if err := requireServerInitialized(); err != nil {
+			return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: err}
 		}
 		return handleToolsList(req)
 	case "tools/call":
-		if atomic.LoadUint32(&isInitialized) == 0 {
-			return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &jsonRPCError{
-				Code:    JSONRPCServerNotInitialized,
-				Message: "Server not initialized",
-				Data:    "Call 'initialize' method first",
-			}}
+		if err := requireServerInitialized(); err != nil {
+			return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: err}
 		}
 		return handleToolsCall(req)
 	case "logging/setLevel":
-		if atomic.LoadUint32(&isInitialized) == 0 {
-			return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &jsonRPCError{
-				Code:    JSONRPCServerNotInitialized,
-				Message: "Server not initialized",
-				Data:    "Call 'initialize' method first",
-			}}
+		if err := requireServerInitialized(); err != nil {
+			return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: err}
 		}
 		return handleLoggingSetLevel(req)
 	default:
-		return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &jsonRPCError{
-			Code:    JSONRPCMethodNotFound,
-			Message: "Method not found",
-			Data: map[string]interface{}{
-				"method":    req.Method,
-				"available": []string{"initialize", "notifications/initialized", "notifications/cancelled", "ping", "tools/list", "tools/call", "logging/setLevel"},
-			},
-		}}
+		return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: newMethodNotFoundError(req.Method)}
 	}
 }
 
 func handleInitialize(req jsonRPCRequest) jsonRPCResponse {
 	var params initializeParams
-	if len(req.Params) > 0 {
-		if err := json.Unmarshal(req.Params, &params); err != nil {
-			return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &jsonRPCError{Code: JSONRPCInvalidParams, Message: "Invalid params", Data: err.Error()}}
-		}
+	if validationErr := validateAndUnmarshalParams(req.Params, &params); validationErr != nil {
+		return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: validationErr}
 	}
 
 	// Supported protocol versions (newest first)
@@ -355,11 +446,9 @@ func handleInitialize(req jsonRPCRequest) jsonRPCResponse {
 	negotiatedVersion := negotiateProtocolVersion(params.ProtocolVersion, supportedVersions)
 
 	if negotiatedVersion == "" {
-		return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &jsonRPCError{
-			Code:    JSONRPCInvalidParams,
-			Message: "Unsupported protocol version",
-			Data:    fmt.Sprintf("Client requested: %s, Server supports: %v", params.ProtocolVersion, supportedVersions),
-		}}
+		return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: newInvalidParamsError(
+			fmt.Sprintf("Client requested: %s, Server supports: %v", params.ProtocolVersion, supportedVersions),
+		)}
 	}
 
 	// Build server capabilities according to MCP specification
@@ -385,6 +474,7 @@ func handleInitialize(req jsonRPCRequest) jsonRPCResponse {
 
 func handleInitialized() jsonRPCResponse {
 	atomic.StoreUint32(&isInitialized, 1)
+
 	// Send tools list changed notification after initialization
 	sendToolsListChangedNotification(os.Stdout)
 
@@ -419,10 +509,8 @@ func handleCancellation(req jsonRPCRequest) jsonRPCResponse {
 
 func handleToolsList(req jsonRPCRequest) jsonRPCResponse {
 	var params toolsListParams
-	if len(req.Params) > 0 {
-		if err := json.Unmarshal(req.Params, &params); err != nil {
-			return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &jsonRPCError{Code: JSONRPCInvalidParams, Message: "Invalid params", Data: err.Error()}}
-		}
+	if validationErr := validateAndUnmarshalParams(req.Params, &params); validationErr != nil {
+		return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: validationErr}
 	}
 
 	// Decode cursor
@@ -433,20 +521,12 @@ func handleToolsList(req jsonRPCRequest) jsonRPCResponse {
 			"cursor":  params.Cursor,
 			"error":   err.Error(),
 		})
-		return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &jsonRPCError{
-			Code:    JSONRPCInvalidParams,
-			Message: "Invalid cursor",
-			Data:    err.Error(),
-		}}
+		return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: newInvalidParamsError(err.Error())}
 	}
 
 	// Validate cursor type
 	if cursor.Type != "tools" {
-		return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &jsonRPCError{
-			Code:    JSONRPCInvalidParams,
-			Message: "Invalid cursor type",
-			Data:    "Cursor type must be 'tools' for tools/list",
-		}}
+		return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: newInvalidParamsError("Cursor type must be 'tools' for tools/list")}
 	}
 
 	// Get all tools and create paginated result
@@ -467,19 +547,13 @@ func handleToolsList(req jsonRPCRequest) jsonRPCResponse {
 
 func handleLoggingSetLevel(req jsonRPCRequest) jsonRPCResponse {
 	var params loggingSetLevelParams
-	if len(req.Params) > 0 {
-		if err := json.Unmarshal(req.Params, &params); err != nil {
-			return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &jsonRPCError{Code: JSONRPCInvalidParams, Message: "Invalid params", Data: err.Error()}}
-		}
+	if validationErr := validateAndUnmarshalParams(req.Params, &params); validationErr != nil {
+		return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: validationErr}
 	}
 
 	// Validate log level
-	if _, valid := logLevelPriority[params.Level]; !valid {
-		return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &jsonRPCError{
-			Code:    JSONRPCInvalidParams,
-			Message: "Invalid log level",
-			Data:    fmt.Sprintf("Valid levels: %v", []string{LogLevelEmergency, LogLevelAlert, LogLevelCritical, LogLevelError, LogLevelWarning, LogLevelNotice, LogLevelInfo, LogLevelDebug}),
-		}}
+	if validationErr := validateLogLevel(params.Level); validationErr != nil {
+		return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: validationErr}
 	}
 
 	// Set the new log level
@@ -516,7 +590,7 @@ func handleSingleRequest(req jsonRPCRequest, stdout io.Writer, stderr io.Writer)
 		writeJSON(stdout, jsonRPCResponse{
 			JSONRPC: "2.0",
 			ID:      req.ID,
-			Error:   &jsonRPCError{Code: JSONRPCInvalidRequest, Message: "Invalid request", Data: "JSON-RPC version must be '2.0'"},
+			Error:   newInvalidRequestError("JSON-RPC version must be '2.0'"),
 		})
 		return
 	}
@@ -525,7 +599,7 @@ func handleSingleRequest(req jsonRPCRequest, stdout io.Writer, stderr io.Writer)
 		writeJSON(stdout, jsonRPCResponse{
 			JSONRPC: "2.0",
 			ID:      req.ID,
-			Error:   &jsonRPCError{Code: JSONRPCInvalidRequest, Message: "Invalid request", Data: "Method is required"},
+			Error:   newInvalidRequestError("Method is required"),
 		})
 		return
 	}
@@ -537,7 +611,7 @@ func handleSingleRequest(req jsonRPCRequest, stdout io.Writer, stderr io.Writer)
 			writeJSON(stdout, jsonRPCResponse{
 				JSONRPC: "2.0",
 				ID:      req.ID,
-				Error:   &jsonRPCError{Code: JSONRPCInvalidRequest, Message: "Invalid request", Data: "Request ID has been previously used in this session"},
+				Error:   newInvalidRequestError("Request ID has been previously used in this session"),
 			})
 			return
 		}
@@ -586,7 +660,11 @@ func handleRequestWithTimeout(req jsonRPCRequest, stdout io.Writer, stderr io.Wr
 			},
 		}
 		writeJSON(stdout, timeoutResp)
-		logToStderr(stderr, fmt.Sprintf("Request %v timed out after %v", req.ID, defaultRequestTimeout))
+		logWarning(stderr, "request", "Request timeout", map[string]interface{}{
+			"requestId": req.ID,
+			"method":    req.Method,
+			"timeout":   defaultRequestTimeout.String(),
+		})
 	}
 }
 
@@ -621,12 +699,12 @@ func handleShutdown(stdout io.Writer, stderr io.Writer) {
 		return true
 	})
 
-	// Send shutdown log message
+	// Send shutdown log message with final statistics
 	sendLogMessage(LogLevelNotice, "server", map[string]any{
 		"message": "MCP server shutdown complete",
 	})
 
-	logToStderr(stderr, "Shutdown complete")
+	logInfo(stderr, "server", "Shutdown complete", nil)
 }
 
 func sanitizeToolName(s string) string {
@@ -953,14 +1031,65 @@ func createPaginatedResult(items []map[string]any, offset, pageSize int, resultT
 
 // isValidToolName validates tool names to prevent injection attacks
 func isValidToolName(name string) bool {
-	// Allow alphanumeric characters, underscores, and hyphens
+	if name == "" || len(name) > 100 {
+		return false
+	}
+
+	// Allow alphanumeric characters, underscores, hyphens, and spaces
 	for _, r := range name {
 		if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') ||
-			(r >= '0' && r <= '9') || r == '_' || r == '-') {
+			(r >= '0' && r <= '9') || r == '_' || r == '-' || r == ' ') {
 			return false
 		}
 	}
-	return len(name) > 0 && len(name) <= 100 // Reasonable length limit
+	return true
+}
+
+// validateToolCallParams validates the parameters for a tool call
+func validateToolCallParams(params toolsCallParams) *jsonRPCError {
+	// Validate tool name
+	if params.Name == "" {
+		return newInvalidParamsError("Tool name is required")
+	}
+
+	if !isValidToolName(params.Name) {
+		return newInvalidParamsError("Tool name contains invalid characters or is too long")
+	}
+
+	// Check if tool exists
+	if !toolExists(params.Name) {
+		return newJSONRPCError(JSONRPCMethodNotFound, "Unknown tool",
+			fmt.Sprintf("Tool '%s' not found", params.Name))
+	}
+
+	// Validate arguments object
+	if params.Arguments == nil {
+		return newInvalidParamsError("Arguments object is required")
+	}
+
+	// Basic argument validation - check for reasonable size
+	if argBytes, err := json.Marshal(params.Arguments); err != nil {
+		return newInvalidParamsError("Invalid arguments object")
+	} else if len(argBytes) > maxRequestBytes/2 { // Allow half of max request size for arguments
+		return newInvalidParamsError("Arguments object too large")
+	}
+
+	return nil
+}
+
+// validateLogLevel validates log level parameters
+func validateLogLevel(level string) *jsonRPCError {
+	if level == "" {
+		return newInvalidParamsError("Log level is required")
+	}
+
+	if _, valid := logLevelPriority[level]; !valid {
+		validLevels := []string{LogLevelEmergency, LogLevelAlert, LogLevelCritical,
+			LogLevelError, LogLevelWarning, LogLevelNotice, LogLevelInfo, LogLevelDebug}
+		return newInvalidParamsError(fmt.Sprintf("Invalid log level. Valid levels: %v", validLevels))
+	}
+
+	return nil
 }
 
 func getRequiredFlags(cmd *cobra.Command) (req []string, oneOf []string) {
@@ -1044,7 +1173,6 @@ func generateToolForCommand(name string, c *cobra.Command) map[string]any {
 	// Mark sensitive commands with higher priority for user review
 	if isSensitiveCommand(name) {
 		annotations["priority"] = 0.9
-		annotations["requiresConfirmation"] = true
 	}
 
 	tool["annotations"] = annotations
@@ -1054,40 +1182,22 @@ func generateToolForCommand(name string, c *cobra.Command) map[string]any {
 
 func handleToolsCall(req jsonRPCRequest) jsonRPCResponse {
 	var p toolsCallParams
-	if len(req.Params) > 0 {
-		if err := json.Unmarshal(req.Params, &p); err != nil {
-			return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &jsonRPCError{Code: JSONRPCInvalidParams, Message: "Invalid params", Data: err.Error()}}
-		}
+	if validationErr := validateAndUnmarshalParams(req.Params, &p); validationErr != nil {
+		return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: validationErr}
 	}
 
-	// Input validation
-	if p.Name == "" {
-		return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &jsonRPCError{
-			Code:    JSONRPCInvalidParams,
-			Message: "Tool name is required",
-		}}
+	// Comprehensive parameter validation
+	if validationErr := validateToolCallParams(p); validationErr != nil {
+		return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: validationErr}
 	}
 
-	// Rate limiting (simple implementation)
+	// Rate limiting
 	if !checkRateLimit(p.Name) {
 		sendLogMessage(LogLevelWarning, "rate_limit", map[string]any{
 			"message": "Rate limit exceeded for tool",
 			"tool":    p.Name,
 		})
-		return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &jsonRPCError{
-			Code:    JSONRPCServerError,
-			Message: "Rate limit exceeded",
-			Data:    "Too many requests for this tool",
-		}}
-	}
-
-	// Input sanitization
-	if !isValidToolName(p.Name) {
-		return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &jsonRPCError{
-			Code:    JSONRPCInvalidParams,
-			Message: "Invalid tool name",
-			Data:    "Tool name contains invalid characters",
-		}}
+		return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: newServerError("Rate limit exceeded", "Too many requests for this tool")}
 	}
 
 	// Set up progress tracking if a progress token is provided
@@ -1391,8 +1501,6 @@ type progressTracker struct {
 	rateLimit time.Duration // minimum time between progress updates
 }
 
-const defaultProgressRateLimit = 100 * time.Millisecond // max 10 updates per second
-
 // newProgressTracker creates a new progress tracker for the given token
 func newProgressTracker(token interface{}, stdout, stderr io.Writer) *progressTracker {
 	return &progressTracker{
@@ -1563,9 +1671,11 @@ func execApictlWithProgress(argv []string, tracker *progressTracker) apictlExecR
 
 	cmd := exec.CommandContext(ctx, exe, argv...)
 
-	var outBuf, errBuf bytes.Buffer
-	cmd.Stdout = &outBuf
-	cmd.Stderr = &errBuf
+	// Use limited buffers to prevent memory exhaustion
+	outBuf := newLimitedBuffer(maxOutputBytes)
+	errBuf := newLimitedBuffer(maxOutputBytes)
+	cmd.Stdout = outBuf
+	cmd.Stderr = errBuf
 
 	// Send initial progress if tracker is available
 	if tracker != nil {
@@ -1602,7 +1712,7 @@ func execApictlWithProgress(argv []string, tracker *progressTracker) apictlExecR
 			if tracker != nil {
 				tracker.sendProgress(100, floatPtr(100), "Operation timed out")
 			}
-			return apictlExecResult{Stdout: safeTruncate(outBuf.String(), maxOutputBytes), Stderr: "execution timed out", ExitCode: 124}
+			return apictlExecResult{Stdout: outBuf.String(), Stderr: "execution timed out", ExitCode: 124}
 		}
 		if ee, ok := waitErr.(*exec.ExitError); ok && ee.ProcessState != nil {
 			exitCode = ee.ProcessState.ExitCode()
@@ -1621,8 +1731,8 @@ func execApictlWithProgress(argv []string, tracker *progressTracker) apictlExecR
 	}
 
 	return apictlExecResult{
-		Stdout:   safeTruncate(outBuf.String(), maxOutputBytes),
-		Stderr:   safeTruncate(errBuf.String(), maxOutputBytes),
+		Stdout:   outBuf.String(),
+		Stderr:   errBuf.String(),
 		ExitCode: exitCode,
 	}
 }
@@ -1676,14 +1786,41 @@ func floatPtr(f float64) *float64 {
 	return &f
 }
 
-func safeTruncate(s string, max int) string {
-	if max <= 0 {
-		return ""
+// limitedBuffer provides a memory-limited buffer for command output
+type limitedBuffer struct {
+	buffer   bytes.Buffer
+	maxSize  int
+	overflow bool
+}
+
+func newLimitedBuffer(maxSize int) *limitedBuffer {
+	return &limitedBuffer{
+		maxSize: maxSize,
 	}
-	if len(s) <= max {
-		return s
+}
+
+func (lb *limitedBuffer) Write(p []byte) (n int, err error) {
+	if lb.buffer.Len() >= lb.maxSize {
+		lb.overflow = true
+		return len(p), nil // Pretend to write successfully but discard
 	}
-	return s[:max]
+
+	available := lb.maxSize - lb.buffer.Len()
+	if len(p) > available {
+		lb.overflow = true
+		_, err = lb.buffer.Write(p[:available])
+		return len(p), err // Return as if we wrote all bytes
+	}
+
+	return lb.buffer.Write(p)
+}
+
+func (lb *limitedBuffer) String() string {
+	result := lb.buffer.String()
+	if lb.overflow {
+		result += "\n... [output truncated due to size limit]"
+	}
+	return result
 }
 
 // addPositionalArguments adds positional argument fields to the tool schema
