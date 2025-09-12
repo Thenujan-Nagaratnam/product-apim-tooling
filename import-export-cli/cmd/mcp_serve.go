@@ -22,6 +22,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -51,8 +52,13 @@ const maxOutputBytes = 4 * 1024 * 1024 // cap stdout/stderr per call
 
 const defaultRequestTimeout = 30 * time.Second
 
+// Pagination configuration
+const defaultPageSize = 75
+const maxPageSize = 200
+
 var toolInclude []string // optional root-level allowlist
 var toolExclude []string // optional root-level denylist
+var pageSize int         // configurable page size for pagination
 
 type jsonRPCRequest struct {
 	JSONRPC string          `json:"jsonrpc"`
@@ -115,12 +121,54 @@ var pendingRequests = sync.Map{}
 var activeProgressTokens = sync.Map{}
 var usedRequestIDs = sync.Map{}
 
+// Security and rate limiting
+var toolCallCounts = sync.Map{}   // map[string]int for rate limiting
+var lastToolCallTime = sync.Map{} // map[string]time.Time for rate limiting
+const maxToolCallsPerMinute = 60
+const rateLimitWindow = time.Minute
+
+// Logging configuration
+var currentLogLevel = "info"      // Default log level
+var logMessageCounts = sync.Map{} // map[string]int for log rate limiting
+var lastLogTime = sync.Map{}      // map[string]time.Time for log rate limiting
+const maxLogMessagesPerMinute = 100
+const logRateLimitWindow = time.Minute
+
+// Log levels following RFC 5424 syslog severity levels
+const (
+	LogLevelEmergency = "emergency"
+	LogLevelAlert     = "alert"
+	LogLevelCritical  = "critical"
+	LogLevelError     = "error"
+	LogLevelWarning   = "warning"
+	LogLevelNotice    = "notice"
+	LogLevelInfo      = "info"
+	LogLevelDebug     = "debug"
+)
+
+// Log level priority (higher number = higher priority)
+var logLevelPriority = map[string]int{
+	LogLevelEmergency: 8,
+	LogLevelAlert:     7,
+	LogLevelCritical:  6,
+	LogLevelError:     5,
+	LogLevelWarning:   4,
+	LogLevelNotice:    3,
+	LogLevelInfo:      2,
+	LogLevelDebug:     1,
+}
+
 // Serve MCP over stdio
 var mcpServeCmd = &cobra.Command{
 	Use:   mcpServeCmdLiteral,
 	Short: mcpServeCmdShortDesc,
 	Long:  mcpServeCmdLongDesc,
 	Run: func(cmd *cobra.Command, args []string) {
+		// Validate page size
+		if pageSize <= 0 || pageSize > maxPageSize {
+			fmt.Fprintf(os.Stderr, "Error: page-size must be between 1 and %d, got %d\n", maxPageSize, pageSize)
+			os.Exit(1)
+		}
 		runMCPServer(os.Stdin, os.Stdout, os.Stderr)
 	},
 }
@@ -130,6 +178,7 @@ func init() {
 	// Flags to control exposed tools
 	mcpServeCmd.Flags().StringSliceVar(&toolInclude, "tool-include", nil, "Comma-separated root commands to include (allowlist)")
 	mcpServeCmd.Flags().StringSliceVar(&toolExclude, "tool-exclude", nil, "Comma-separated root commands to exclude (denylist)")
+	mcpServeCmd.Flags().IntVar(&pageSize, "page-size", defaultPageSize, fmt.Sprintf("Page size for pagination (max: %d)", maxPageSize))
 }
 
 func runMCPServer(stdin io.Reader, stdout io.Writer, stderr io.Writer) {
@@ -262,7 +311,7 @@ func dispatchMCP(req jsonRPCRequest) jsonRPCResponse {
 				Data:    "Call 'initialize' method first",
 			}}
 		}
-		return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{"tools": listCommandsAsTools()}}
+		return handleToolsList(req)
 	case "tools/call":
 		if atomic.LoadUint32(&isInitialized) == 0 {
 			return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &jsonRPCError{
@@ -272,13 +321,22 @@ func dispatchMCP(req jsonRPCRequest) jsonRPCResponse {
 			}}
 		}
 		return handleToolsCall(req)
+	case "logging/setLevel":
+		if atomic.LoadUint32(&isInitialized) == 0 {
+			return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &jsonRPCError{
+				Code:    JSONRPCServerNotInitialized,
+				Message: "Server not initialized",
+				Data:    "Call 'initialize' method first",
+			}}
+		}
+		return handleLoggingSetLevel(req)
 	default:
 		return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &jsonRPCError{
 			Code:    JSONRPCMethodNotFound,
 			Message: "Method not found",
 			Data: map[string]interface{}{
 				"method":    req.Method,
-				"available": []string{"initialize", "notifications/initialized", "notifications/cancelled", "ping", "tools/list", "tools/call"},
+				"available": []string{"initialize", "notifications/initialized", "notifications/cancelled", "ping", "tools/list", "tools/call", "logging/setLevel"},
 			},
 		}}
 	}
@@ -293,7 +351,7 @@ func handleInitialize(req jsonRPCRequest) jsonRPCResponse {
 	}
 
 	// Supported protocol versions (newest first)
-	supportedVersions := []string{"2025-03-26", "2024-11-05"}
+	supportedVersions := []string{"2025-06-18", "2025-03-26"}
 	negotiatedVersion := negotiateProtocolVersion(params.ProtocolVersion, supportedVersions)
 
 	if negotiatedVersion == "" {
@@ -309,6 +367,7 @@ func handleInitialize(req jsonRPCRequest) jsonRPCResponse {
 		"tools": map[string]interface{}{
 			"listChanged": true,
 		},
+		"logging": map[string]interface{}{},
 	}
 
 	result := initializeResult{
@@ -326,6 +385,15 @@ func handleInitialize(req jsonRPCRequest) jsonRPCResponse {
 
 func handleInitialized() jsonRPCResponse {
 	atomic.StoreUint32(&isInitialized, 1)
+	// Send tools list changed notification after initialization
+	sendToolsListChangedNotification(os.Stdout)
+
+	// Send info log about server initialization
+	sendLogMessage(LogLevelInfo, "server", map[string]any{
+		"message": "MCP server initialized",
+		"version": "1.0",
+	})
+
 	// Notifications don't require a response according to JSON-RPC spec
 	return jsonRPCResponse{} // Empty response (won't be written)
 }
@@ -347,6 +415,83 @@ func handleCancellation(req jsonRPCRequest) jsonRPCResponse {
 
 	// Notifications don't require a response
 	return jsonRPCResponse{}
+}
+
+func handleToolsList(req jsonRPCRequest) jsonRPCResponse {
+	var params toolsListParams
+	if len(req.Params) > 0 {
+		if err := json.Unmarshal(req.Params, &params); err != nil {
+			return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &jsonRPCError{Code: JSONRPCInvalidParams, Message: "Invalid params", Data: err.Error()}}
+		}
+	}
+
+	// Decode cursor
+	cursor, err := decodeCursor(params.Cursor)
+	if err != nil {
+		sendLogMessage(LogLevelWarning, "pagination", map[string]any{
+			"message": "Invalid cursor provided",
+			"cursor":  params.Cursor,
+			"error":   err.Error(),
+		})
+		return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &jsonRPCError{
+			Code:    JSONRPCInvalidParams,
+			Message: "Invalid cursor",
+			Data:    err.Error(),
+		}}
+	}
+
+	// Validate cursor type
+	if cursor.Type != "tools" {
+		return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &jsonRPCError{
+			Code:    JSONRPCInvalidParams,
+			Message: "Invalid cursor type",
+			Data:    "Cursor type must be 'tools' for tools/list",
+		}}
+	}
+
+	// Get all tools and create paginated result
+	allTools := listCommandsAsTools()
+	result := createPaginatedResult(allTools, cursor.Offset, pageSize, "tools")
+
+	// Log pagination operation
+	sendLogMessage(LogLevelDebug, "pagination", map[string]any{
+		"message":    "Tools list paginated",
+		"offset":     cursor.Offset,
+		"pageSize":   pageSize,
+		"totalTools": len(allTools),
+		"hasNext":    result["nextCursor"] != nil,
+	})
+
+	return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Result: result}
+}
+
+func handleLoggingSetLevel(req jsonRPCRequest) jsonRPCResponse {
+	var params loggingSetLevelParams
+	if len(req.Params) > 0 {
+		if err := json.Unmarshal(req.Params, &params); err != nil {
+			return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &jsonRPCError{Code: JSONRPCInvalidParams, Message: "Invalid params", Data: err.Error()}}
+		}
+	}
+
+	// Validate log level
+	if _, valid := logLevelPriority[params.Level]; !valid {
+		return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &jsonRPCError{
+			Code:    JSONRPCInvalidParams,
+			Message: "Invalid log level",
+			Data:    fmt.Sprintf("Valid levels: %v", []string{LogLevelEmergency, LogLevelAlert, LogLevelCritical, LogLevelError, LogLevelWarning, LogLevelNotice, LogLevelInfo, LogLevelDebug}),
+		}}
+	}
+
+	// Set the new log level
+	currentLogLevel = params.Level
+
+	// Send a notice about the log level change
+	sendLogMessage(LogLevelNotice, "server", map[string]any{
+		"message":  "Log level changed",
+		"newLevel": params.Level,
+	})
+
+	return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{}}
 }
 
 func negotiateProtocolVersion(clientVersion string, supportedVersions []string) string {
@@ -476,6 +621,11 @@ func handleShutdown(stdout io.Writer, stderr io.Writer) {
 		return true
 	})
 
+	// Send shutdown log message
+	sendLogMessage(LogLevelNotice, "server", map[string]any{
+		"message": "MCP server shutdown complete",
+	})
+
 	logToStderr(stderr, "Shutdown complete")
 }
 
@@ -554,6 +704,265 @@ func shouldExposeCommand(commandPath string) bool {
 	return true
 }
 
+// isSensitiveCommand determines if a command requires special attention for security
+func isSensitiveCommand(commandPath string) bool {
+	cmd := strings.ToLower(strings.TrimSpace(commandPath))
+
+	// Commands that modify data or have security implications
+	sensitiveCommands := []string{
+		"delete", "remove", "undeploy", "change", "import", "export",
+		"add", "create", "update", "set",
+	}
+
+	for _, sensitive := range sensitiveCommands {
+		if strings.Contains(cmd, sensitive) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// toolExists checks if a tool with the given name exists
+func toolExists(toolName string) bool {
+	tools := listCommandsAsTools()
+	for _, tool := range tools {
+		if name, ok := tool["name"].(string); ok && name == toolName {
+			return true
+		}
+	}
+	return false
+}
+
+// checkRateLimit implements simple rate limiting for tool calls
+func checkRateLimit(toolName string) bool {
+	now := time.Now()
+
+	// Get or create rate limit data for this tool
+	if lastTime, exists := lastToolCallTime.Load(toolName); exists {
+		if lastTime.(time.Time).Add(rateLimitWindow).After(now) {
+			// Still within rate limit window
+			if count, exists := toolCallCounts.Load(toolName); exists {
+				if count.(int) >= maxToolCallsPerMinute {
+					return false // Rate limit exceeded
+				}
+				toolCallCounts.Store(toolName, count.(int)+1)
+			} else {
+				toolCallCounts.Store(toolName, 1)
+			}
+		} else {
+			// Rate limit window expired, reset
+			toolCallCounts.Store(toolName, 1)
+			lastToolCallTime.Store(toolName, now)
+		}
+	} else {
+		// First call for this tool
+		toolCallCounts.Store(toolName, 1)
+		lastToolCallTime.Store(toolName, now)
+	}
+
+	return true
+}
+
+// sendToolsListChangedNotification sends a notification when the tools list changes
+func sendToolsListChangedNotification(stdout io.Writer) {
+	notification := map[string]interface{}{
+		"jsonrpc": "2.0",
+		"method":  "notifications/tools/list_changed",
+	}
+	writeJSON(stdout, notification)
+	logToStderr(os.Stderr, "Tools list changed notification sent")
+}
+
+// sendLogMessage sends a structured log message notification
+func sendLogMessage(level, logger string, data map[string]any) {
+	// Check if the log level should be sent based on current log level
+	if !shouldLog(level) {
+		return
+	}
+
+	// Rate limiting for log messages
+	if !checkLogRateLimit(logger) {
+		return
+	}
+
+	// Sanitize data to remove sensitive information
+	sanitizedData := sanitizeLogData(data)
+
+	// Send the log message notification
+	notification := map[string]interface{}{
+		"jsonrpc": "2.0",
+		"method":  "notifications/message",
+		"params": logMessageParams{
+			Level:  level,
+			Logger: logger,
+			Data:   sanitizedData,
+		},
+	}
+
+	writeJSON(os.Stdout, notification)
+}
+
+// shouldLog determines if a message should be logged based on current log level
+func shouldLog(level string) bool {
+	messagePriority, exists := logLevelPriority[level]
+	if !exists {
+		return false
+	}
+
+	currentPriority, exists := logLevelPriority[currentLogLevel]
+	if !exists {
+		return false
+	}
+
+	// Log if message priority is >= current log level priority
+	return messagePriority >= currentPriority
+}
+
+// checkLogRateLimit implements rate limiting for log messages
+func checkLogRateLimit(logger string) bool {
+	now := time.Now()
+
+	// Get or create rate limit data for this logger
+	if lastTime, exists := lastLogTime.Load(logger); exists {
+		if lastTime.(time.Time).Add(logRateLimitWindow).After(now) {
+			// Still within rate limit window
+			if count, exists := logMessageCounts.Load(logger); exists {
+				if count.(int) >= maxLogMessagesPerMinute {
+					return false // Rate limit exceeded
+				}
+				logMessageCounts.Store(logger, count.(int)+1)
+			} else {
+				logMessageCounts.Store(logger, 1)
+			}
+		} else {
+			// Rate limit window expired, reset
+			logMessageCounts.Store(logger, 1)
+			lastLogTime.Store(logger, now)
+		}
+	} else {
+		// First log for this logger
+		logMessageCounts.Store(logger, 1)
+		lastLogTime.Store(logger, now)
+	}
+
+	return true
+}
+
+// sanitizeLogData removes sensitive information from log data
+func sanitizeLogData(data map[string]any) map[string]any {
+	if data == nil {
+		return nil
+	}
+
+	sanitized := make(map[string]any)
+
+	// Sensitive keys to redact
+	sensitiveKeys := []string{
+		"password", "token", "key", "secret", "credential", "auth",
+		"authorization", "cookie", "session", "api_key", "apikey",
+	}
+
+	for key, value := range data {
+		keyLower := strings.ToLower(key)
+		isSensitive := false
+
+		for _, sensitive := range sensitiveKeys {
+			if strings.Contains(keyLower, sensitive) {
+				isSensitive = true
+				break
+			}
+		}
+
+		if isSensitive {
+			sanitized[key] = "[REDACTED]"
+		} else {
+			sanitized[key] = value
+		}
+	}
+
+	return sanitized
+}
+
+// encodeCursor encodes a pagination cursor to a base64 string
+func encodeCursor(cursor paginationCursor) string {
+	data, err := json.Marshal(cursor)
+	if err != nil {
+		return ""
+	}
+	return base64.StdEncoding.EncodeToString(data)
+}
+
+// decodeCursor decodes a base64 string to a pagination cursor
+func decodeCursor(cursorStr string) (*paginationCursor, error) {
+	if cursorStr == "" {
+		return &paginationCursor{Offset: 0, Type: "tools"}, nil
+	}
+
+	data, err := base64.StdEncoding.DecodeString(cursorStr)
+	if err != nil {
+		return nil, fmt.Errorf("invalid cursor format")
+	}
+
+	var cursor paginationCursor
+	if err := json.Unmarshal(data, &cursor); err != nil {
+		return nil, fmt.Errorf("invalid cursor data")
+	}
+
+	return &cursor, nil
+}
+
+// createPaginatedResult creates a paginated result with proper cursor handling
+func createPaginatedResult(items []map[string]any, offset, pageSize int, resultType string) map[string]any {
+	totalItems := len(items)
+
+	// Calculate page bounds
+	if offset < 0 {
+		offset = 0
+	}
+	if offset >= totalItems {
+		return map[string]any{
+			"tools": []map[string]any{},
+		}
+	}
+
+	pageEnd := offset + pageSize
+	if pageEnd > totalItems {
+		pageEnd = totalItems
+	}
+
+	// Get the page of items
+	pageItems := items[offset:pageEnd]
+
+	// Prepare result
+	result := map[string]any{
+		"tools": pageItems,
+	}
+
+	// Add nextCursor if there are more items
+	if pageEnd < totalItems {
+		nextCursor := paginationCursor{
+			Offset: pageEnd,
+			Type:   resultType,
+		}
+		result["nextCursor"] = encodeCursor(nextCursor)
+	}
+
+	return result
+}
+
+// isValidToolName validates tool names to prevent injection attacks
+func isValidToolName(name string) bool {
+	// Allow alphanumeric characters, underscores, and hyphens
+	for _, r := range name {
+		if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') ||
+			(r >= '0' && r <= '9') || r == '_' || r == '-') {
+			return false
+		}
+	}
+	return len(name) > 0 && len(name) <= 100 // Reasonable length limit
+}
+
 func getRequiredFlags(cmd *cobra.Command) (req []string, oneOf []string) {
 	cmd.Flags().VisitAll(func(f *pflag.Flag) {
 		if f.Annotations == nil {
@@ -613,7 +1022,34 @@ func generateToolForCommand(name string, c *cobra.Command) map[string]any {
 		}
 		schema["anyOf"] = anyOf
 	}
-	return map[string]any{"name": sanitizeToolName(name), "description": c.Short, "inputSchema": schema}
+	tool := map[string]any{
+		"name":        sanitizeToolName(name),
+		"description": c.Long,
+		"inputSchema": schema,
+	}
+
+	// Add title if available (use Long description if Short is empty)
+	if c.Short != "" {
+		tool["title"] = c.Short
+	} else if c.Long != "" && c.Short != c.Long {
+		tool["title"] = c.Long
+	}
+
+	// Add annotations for trust & safety
+	annotations := map[string]any{
+		"audience": []string{"assistant"},
+		"priority": 0.8,
+	}
+
+	// Mark sensitive commands with higher priority for user review
+	if isSensitiveCommand(name) {
+		annotations["priority"] = 0.9
+		annotations["requiresConfirmation"] = true
+	}
+
+	tool["annotations"] = annotations
+
+	return tool
 }
 
 func handleToolsCall(req jsonRPCRequest) jsonRPCResponse {
@@ -622,6 +1058,36 @@ func handleToolsCall(req jsonRPCRequest) jsonRPCResponse {
 		if err := json.Unmarshal(req.Params, &p); err != nil {
 			return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &jsonRPCError{Code: JSONRPCInvalidParams, Message: "Invalid params", Data: err.Error()}}
 		}
+	}
+
+	// Input validation
+	if p.Name == "" {
+		return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &jsonRPCError{
+			Code:    JSONRPCInvalidParams,
+			Message: "Tool name is required",
+		}}
+	}
+
+	// Rate limiting (simple implementation)
+	if !checkRateLimit(p.Name) {
+		sendLogMessage(LogLevelWarning, "rate_limit", map[string]any{
+			"message": "Rate limit exceeded for tool",
+			"tool":    p.Name,
+		})
+		return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &jsonRPCError{
+			Code:    JSONRPCServerError,
+			Message: "Rate limit exceeded",
+			Data:    "Too many requests for this tool",
+		}}
+	}
+
+	// Input sanitization
+	if !isValidToolName(p.Name) {
+		return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &jsonRPCError{
+			Code:    JSONRPCInvalidParams,
+			Message: "Invalid tool name",
+			Data:    "Tool name contains invalid characters",
+		}}
 	}
 
 	// Set up progress tracking if a progress token is provided
@@ -658,23 +1124,73 @@ func handleToolsCall(req jsonRPCRequest) jsonRPCResponse {
 		return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &jsonRPCError{Code: JSONRPCInvalidParams, Message: "calling mcp via MCP is not allowed"}}
 	}
 
-	res := execApictlWithProgress(argv, progressTracker)
-
-	// Combine stdout and stderr for better error reporting
-	var output string
-	if res.Stdout != "" && res.Stderr != "" {
-		output = res.Stdout + "\n" + res.Stderr
-	} else if res.Stdout != "" {
-		output = res.Stdout
-	} else if res.Stderr != "" {
-		output = res.Stderr
-	} else {
-		output = fmt.Sprintf("Exit status %d", res.ExitCode)
+	// Check if the tool exists
+	if !toolExists(p.Name) {
+		return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &jsonRPCError{
+			Code:    JSONRPCMethodNotFound,
+			Message: "Unknown tool",
+			Data:    fmt.Sprintf("Tool '%s' not found", p.Name),
+		}}
 	}
 
+	// Log tool execution start
+	sendLogMessage(LogLevelDebug, "tool_execution", map[string]any{
+		"message": "Tool execution started",
+		"tool":    p.Name,
+		"argv":    argv,
+	})
+
+	res := execApictlWithProgress(argv, progressTracker)
+
+	// Log tool execution result
+	if res.ExitCode == 0 {
+		sendLogMessage(LogLevelInfo, "tool_execution", map[string]any{
+			"message": "Tool execution completed successfully",
+			"tool":    p.Name,
+		})
+	} else {
+		sendLogMessage(LogLevelError, "tool_execution", map[string]any{
+			"message":  "Tool execution failed",
+			"tool":     p.Name,
+			"exitCode": res.ExitCode,
+		})
+	}
+
+	// Prepare content based on the result
+	var content []map[string]any
+
+	// Add stdout if available
+	if res.Stdout != "" {
+		content = append(content, map[string]any{
+			"type": "text",
+			"text": res.Stdout,
+		})
+	}
+
+	// Add stderr if available (usually indicates an error)
+	if res.Stderr != "" {
+		content = append(content, map[string]any{
+			"type": "text",
+			"text": res.Stderr,
+		})
+	}
+
+	// If no content, provide exit status
+	if len(content) == 0 {
+		content = append(content, map[string]any{
+			"type": "text",
+			"text": fmt.Sprintf("Command completed with exit status %d", res.ExitCode),
+		})
+	}
+
+	// Determine if this is an error
+	isError := res.ExitCode != 0
+
+	// For tool execution errors, return success with isError: true
+	// For protocol errors, we would return a JSON-RPC error instead
 	return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{
-		"content": []map[string]any{{"type": "text", "text": output}},
-		"isError": res.ExitCode != 0,
+		"content": content,
+		"isError": isError,
 	}}
 }
 
@@ -828,10 +1344,30 @@ func toBool(v any) (bool, bool) {
 	}
 }
 
+type toolsListParams struct {
+	Cursor string `json:"cursor,omitempty"`
+}
+
+// paginationCursor represents the internal structure of a pagination cursor
+type paginationCursor struct {
+	Offset int    `json:"offset"`
+	Type   string `json:"type"` // "tools", "resources", etc.
+}
+
 type toolsCallParams struct {
 	Name      string         `json:"name"`
 	Arguments map[string]any `json:"arguments"`
 	Meta      *requestMeta   `json:"_meta,omitempty"`
+}
+
+type loggingSetLevelParams struct {
+	Level string `json:"level"`
+}
+
+type logMessageParams struct {
+	Level  string         `json:"level"`
+	Logger string         `json:"logger,omitempty"`
+	Data   map[string]any `json:"data,omitempty"`
 }
 
 // requestMeta contains metadata for requests, including progress tokens
